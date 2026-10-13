@@ -98,7 +98,6 @@ def build_matrices(case):
         B[case['bus_idx'][row['bus_i']], i] = 1
     return K, L, B, eligible
 
-
 def build_p1(case, include_lines=False):
     K, L, B, eligible = build_matrices(case)
 
@@ -486,7 +485,7 @@ def main():
     parser.add_argument('--case', required=True, help='Path to PGLib-style Excel workbook')
     parser.add_argument('--gamma', type=float, default=0.05, help='APR coefficient (default: 0.05)')
     parser.add_argument('--m-eta', type=float, default=1500.0, help='Thermal slack penalty (default: 1500)')
-    parser.add_argument('--line-contingencies', action='store_true', help='Enable non-islanding line outages (P1 equation 13)')
+    parser.add_argument('--line-contingencies',action=argparse.BooleanOptionalAction,default=True,help='Enable non-islanding line contingencies (default: enabled)' )
     parser.add_argument('--time-limit', type=float, default=None)
     parser.add_argument('--mip-gap', type=float, default=1e-4)
     parser.add_argument('--output-dir', type=str, default='output', help='Directory for saving optimization results' )
