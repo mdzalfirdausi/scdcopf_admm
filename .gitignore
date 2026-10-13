@@ -1,5 +1,6 @@
 # Generated optimization results
 output/
+uncertainty/
 
 # Temporary Microsoft Excel files
 ~$*.xlsx
