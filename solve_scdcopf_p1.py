@@ -10,6 +10,7 @@ Usage:
   python solve_scdcopf_p1.py --case pglib_opf_case3_lmbd.xlsx --gamma 1.0
   python solve_scdcopf_p1.py --case pglib_opf_case3_lmbd.xlsx --gamma 1.0 --line-contingencies
 """
+from apr_binary_search import apr_binary_search
 import argparse
 from pathlib import Path
 import numpy as np
@@ -700,6 +701,7 @@ def main():
             load_solutions=False
         )
 
+        
         term = result.solver.termination_condition
         print(f"Termination: {term}")
 
@@ -713,10 +715,67 @@ def main():
 
         mdl.solutions.load_from(result)
 
+        # ============================================================
+        # APR BINARY-SEARCH VALIDATION
+        # ============================================================
+
+        g_star = np.array([
+            pyo.value(mdl.g[i])
+            for i in mdl.G
+        ])
+
+        demand = sum(
+            pyo.value(mdl.d[j])
+            for j in mdl.N
+        )
+
+        gmin = data["lo"]
+        gmax = data["hi"]
+
+        print("\nAPR BINARY-SEARCH VALIDATION")
+
+        for k in mdl.Kg:
+
+            # Gurobi post-contingency dispatch
+            gk_star = np.array([
+                pyo.value(mdl.gk[k, i])
+                for i in mdl.G
+            ])
+
+            # Reconstruct using APR binary search
+            gk_bs, zk_bs, xk_bs, feasible = apr_binary_search(
+                g=g_star,
+                gmin=gmin,
+                gmax=gmax,
+                gamma=args.gamma,
+                k=k,
+                demand=demand
+            )
+
+            if not feasible:
+                print(f"Contingency {k}: APR reconstruction failed")
+                continue
+
+            # Compare reconstructed dispatch against Gurobi
+            error_MW = np.max(
+                np.abs(gk_bs - gk_star)
+            ) * data["base"]
+
+            print(
+                f"Contingency {k}: "
+                f"z_BS={zk_bs:.8f}, "
+                f"dispatch_error={error_MW:.8e} MW"
+            )
+
+        # ============================================================
+        # EXISTING RESULT EXTRACTION
+        # ============================================================
+
         objective = pyo.value(mdl.obj)
         base = data["base"]
         gens = case["gens"]
         lines = case["lines"]
+
 
         # Nominal dispatch
         gen_df = pd.DataFrame([
