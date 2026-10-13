@@ -85,7 +85,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n-scenarios",
         type=int,
-        default=100,
+        default=3,
         help="Number of uncertainty scenarios (default: 100)"
     )
 

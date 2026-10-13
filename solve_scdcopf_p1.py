@@ -108,8 +108,26 @@ def build_p1(case, include_lines=False):
     Kg = list(range(ng))
     Ke = eligible if include_lines else []
 
+    
     base = case['base']
-    d = case['buses']['Pd'].to_numpy(dtype=float) / base
+
+    # Nominal demand
+    d_nominal = (
+        case['buses']['Pd'].to_numpy(dtype=float) / base
+    )
+
+    # Selected uncertainty realization (per unit)
+    omega = np.asarray(
+            case.get('omega', np.zeros_like(d_nominal)),
+            dtype=float
+        )
+
+    if omega.shape != d_nominal.shape:
+        raise ValueError("Uncertainty dimension does not match buses")
+
+    # Realized demand
+    d = d_nominal + omega
+
     lo = case['gens']['Pmin'].to_numpy(dtype=float) / base
     hi = case['gens']['Pmax'].to_numpy(dtype=float) / base
     c1 = case['gens']['c1'].to_numpy(dtype=float) * base
@@ -481,15 +499,48 @@ def build_p1(case, include_lines=False):
     )
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--case', required=True, help='Path to PGLib-style Excel workbook')
-    parser.add_argument('--gamma', type=float, default=0.05, help='APR coefficient (default: 0.05)')
-    parser.add_argument('--m-eta', type=float, default=1500.0, help='Thermal slack penalty (default: 1500)')
-    parser.add_argument('--line-contingencies',action=argparse.BooleanOptionalAction,default=True,help='Enable non-islanding line contingencies (default: enabled)' )
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('--case', required=True)
+    parser.add_argument('--gamma', type=float, default=0.05)
+    parser.add_argument('--m-eta', type=float, default=1500.0)
+
+    parser.add_argument(
+        '--line-contingencies',
+        action=argparse.BooleanOptionalAction,
+        default=True
+    )
+
     parser.add_argument('--time-limit', type=float, default=None)
     parser.add_argument('--mip-gap', type=float, default=1e-4)
-    parser.add_argument('--output-dir', type=str, default='output', help='Directory for saving optimization results' )
-    parser.add_argument('--tee', action='store_true', help='Print Gurobi log')
+    parser.add_argument('--output-dir', type=str, default='output')
+    parser.add_argument('--tee', action='store_true')
+
+    # Uncertainty arguments
+    parser.add_argument(
+        '--sigma-scaling',
+        type=float,
+        default=None,
+        help='Enable uncertainty when specified'
+    )
+
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=19,
+        help='Seed identifying the uncertainty dataset'
+    )
+
+    parser.add_argument(
+        '--scenario-id',
+        type=int,
+        default=None,
+        help='Solve one scenario; default is all scenarios'
+    )
+
     args = parser.parse_args()
     case_path = Path(args.case)
     # Search the default directory if only a filename is provided
@@ -501,54 +552,235 @@ def main():
     if not case_path.is_file():
         parser.error(f"Excel file not found: {case_path}")
     case = load_case(case_path, args.gamma, args.m_eta)
-        
-    # Output directory relative to this Python script
+    
+    # ============================================================
+    # LOAD UNCERTAINTY SCENARIOS
+    # ============================================================
+
+    if args.sigma_scaling is None:
+        # No uncertainty: solve the nominal case only
+        scenarios = [(None, np.zeros(len(case["buses"])))]
+
+    else:
+        sigma_tag = f"{args.sigma_scaling:.4f}".replace(".", "p")
+
+        uncertainty_path = (
+            Path(__file__).resolve().parent
+            / "uncertainty"
+            / f"omega_{case_path.stem}_sigma{sigma_tag}_seed{args.seed}.npz"
+        )
+
+        if not uncertainty_path.is_file():
+            parser.error(f"Uncertainty file not found: {uncertainty_path}")
+
+        with np.load(uncertainty_path) as uncertainty_data:
+            omega_all = uncertainty_data["omega"]
+            saved_bus_ids = uncertainty_data["bus_ids"]
+
+            if "sigma_scaling" in uncertainty_data:
+                saved_sigma = float(uncertainty_data["sigma_scaling"])
+                if not np.isclose(saved_sigma, args.sigma_scaling):
+                    raise ValueError("Sigma scaling mismatch")
+
+            if "seed" in uncertainty_data:
+                if int(uncertainty_data["seed"]) != args.seed:
+                    raise ValueError("Seed mismatch")
+
+        current_bus_ids = case["buses"]["bus_i"].to_numpy()
+
+        if not np.array_equal(saved_bus_ids, current_bus_ids):
+            raise ValueError("Bus ordering mismatch")
+
+        if omega_all.ndim != 2 or omega_all.shape[1] != len(current_bus_ids):
+            raise ValueError("Invalid uncertainty matrix dimensions")
+
+        if args.scenario_id is None:
+            scenarios = list(enumerate(omega_all))
+        else:
+            if not 0 <= args.scenario_id < len(omega_all):
+                parser.error("Invalid scenario ID")
+
+            scenarios = [(args.scenario_id, omega_all[args.scenario_id])]
+
+    print(f"Number of scenarios to solve: {len(scenarios)}")
+
+    if args.sigma_scaling is None:
+        print("Mode: Nominal SCDCOPF (omega = 0)")
+    else:
+        print(f"Uncertainty file: {uncertainty_path.name}")
+        print(f"Seed: {args.seed}")
+        print(f"Sigma scaling: {args.sigma_scaling}")
+
+    print(f"Number of scenarios to solve: {len(scenarios)}")
+    # ============================================================
+    # SOLVE ALL SELECTED SCENARIOS
+    # ============================================================
+
     output_dir = Path(__file__).resolve().parent / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Example: pglib_opf_case3_lmbd.xlsx -> p1_solution_pglib_opf_case3_lmbd.xlsx
-    case_name = case_path.stem
-    output_path = output_dir / f"p1_solution_{case_name}.xlsx"
 
-    mdl, data = build_p1(case, args.line_contingencies)
-    print(f"Buses={len(case['buses'])}, generators={len(case['gens'])}, branches={len(case['lines'])}, "
-          f"generator outages={len(data['Kg'])}, line outages={len(data['Ke'])}")
-    solver = pyo.SolverFactory('gurobi')
+    case_name = case_path.stem
+
+    solver = pyo.SolverFactory("gurobi")
+
     if not solver.available(exception_flag=False):
-        raise RuntimeError('Gurobi is not available to Pyomo; install gurobipy and configure a valid license')
+        raise RuntimeError("Gurobi is not available")
+
     if args.time_limit is not None:
-        solver.options['TimeLimit'] = args.time_limit
-    solver.options['MIPGap'] = args.mip_gap
-    result = solver.solve(mdl, tee=args.tee, load_solutions=False)
-    term = result.solver.termination_condition
-    print(f'Solver status: {result.solver.status}; termination: {term}')
-    if len(result.solution) == 0:
-        print('No feasible incumbent returned. Check APR capacity, contingency feasibility, and solver log.')
-        return 2
-    mdl.solutions.load_from(result)
-    print(f'Objective: {pyo.value(mdl.obj):.6f}')
-    print(f'Base dispatch (MW): {[round(pyo.value(mdl.g[i])*data["base"],6) for i in mdl.G]}')
-    gens = case['gens']
-    gen_df = pd.DataFrame([dict(gen_ID=gens.iloc[i]['gen_ID'], bus_i=gens.iloc[i]['bus_i'],
-        Pg_MW=pyo.value(mdl.g[i])*data['base']) for i in mdl.G])
-    cont_df = pd.DataFrame([dict(outage_gen_ID=gens.iloc[k]['gen_ID'],
-        gen_ID=gens.iloc[i]['gen_ID'], Pg_MW=pyo.value(mdl.gk[k,i])*data['base'],
-        z=pyo.value(mdl.zk[k]), x=(int(round(pyo.value(mdl.xk[k,i]))) if i != k else None))
-        for k in mdl.Kg for i in mdl.G])
-    slack_df = pd.DataFrame([dict(type='base', outage=None, line_ID=case['lines'].iloc[l]['line_ID'],
-        slack_MW=pyo.value(mdl.eta0[l])*data['base']) for l in mdl.BR] +
-        [dict(type='generator', outage=gens.iloc[k]['gen_ID'], line_ID=case['lines'].iloc[l]['line_ID'],
-        slack_MW=pyo.value(mdl.eta_kg[k,l])*data['base']) for k,l in mdl.EKG] +
-        [dict(type='line', outage=case['lines'].iloc[k]['line_ID'], line_ID=case['lines'].iloc[l]['line_ID'],
-        slack_MW=pyo.value(mdl.eta_ke[k,l])*data['base']) for k,l in mdl.EKE])
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        gen_df.to_excel(writer, sheet_name='nominal_dispatch', index=False)
-        cont_df.to_excel(writer, sheet_name='generator_contingencies', index=False)
-        slack_df.to_excel(writer, sheet_name='thermal_slacks', index=False)
-        pd.DataFrame([dict(termination=str(term), objective=pyo.value(mdl.obj), gamma=args.gamma,
-            line_contingencies=args.line_contingencies)]).to_excel(writer, sheet_name='summary', index=False)
-    print(f'Saved {output_path}')
-    if term != TerminationCondition.optimal:
-        print('WARNING: Solution is an incumbent, not a certified optimum.')
+        solver.options["TimeLimit"] = args.time_limit
+
+    solver.options["MIPGap"] = args.mip_gap
+
+    summary_records = []
+
+    for scenario_id, omega in scenarios:
+
+        case["omega"] = np.asarray(omega, dtype=float)
+
+        print("\n" + "=" * 65)
+        print(f"Solving scenario: {scenario_id if scenario_id is not None else 'nominal'}")
+        print("=" * 65)
+
+        # Build a fresh P1 model for this uncertainty realization
+        mdl, data = build_p1(
+            case,
+            include_lines=args.line_contingencies
+        )
+
+        result = solver.solve(
+            mdl,
+            tee=args.tee,
+            load_solutions=False
+        )
+
+        term = result.solver.termination_condition
+        print(f"Termination: {term}")
+
+        if len(result.solution) == 0:
+            summary_records.append({
+                "scenario_id": scenario_id,
+                "termination": str(term),
+                "objective": np.nan
+            })
+            continue
+
+        mdl.solutions.load_from(result)
+
+        objective = pyo.value(mdl.obj)
+        base = data["base"]
+        gens = case["gens"]
+        lines = case["lines"]
+
+        # Nominal dispatch
+        gen_df = pd.DataFrame([
+            {
+                "gen_ID": gens.iloc[i]["gen_ID"],
+                "bus_i": gens.iloc[i]["bus_i"],
+                "Pg_MW": pyo.value(mdl.g[i]) * base
+            }
+            for i in mdl.G
+        ])
+
+        # Generator-contingency dispatch
+        cont_df = pd.DataFrame([
+            {
+                "outage_gen_ID": gens.iloc[k]["gen_ID"],
+                "gen_ID": gens.iloc[i]["gen_ID"],
+                "Pg_MW": pyo.value(mdl.gk[k, i]) * base,
+                "z": pyo.value(mdl.zk[k]),
+                "x": (
+                    int(round(pyo.value(mdl.xk[k, i])))
+                    if i != k else None
+                )
+            }
+            for k in mdl.Kg for i in mdl.G
+        ])
+
+        # Thermal slacks
+        slack_df = pd.DataFrame(
+            [
+                {
+                    "type": "base",
+                    "outage": None,
+                    "line_ID": lines.iloc[l]["line_ID"],
+                    "slack_MW": pyo.value(mdl.eta0[l]) * base
+                }
+                for l in mdl.BR
+            ]
+            +
+            [
+                {
+                    "type": "generator",
+                    "outage": gens.iloc[k]["gen_ID"],
+                    "line_ID": lines.iloc[l]["line_ID"],
+                    "slack_MW": pyo.value(mdl.eta_kg[k, l]) * base
+                }
+                for k, l in mdl.EKG
+            ]
+            +
+            [
+                {
+                    "type": "line",
+                    "outage": lines.iloc[k]["line_ID"],
+                    "line_ID": lines.iloc[l]["line_ID"],
+                    "slack_MW": pyo.value(mdl.eta_ke[k, l]) * base
+                }
+                for k, l in mdl.EKE
+            ]
+        )
+
+        # Save each scenario independently
+        if scenario_id is None:
+            filename = f"p1_solution_{case_name}_nominal.xlsx"
+        else:
+            filename = (
+                f"p1_solution_{case_name}_"
+                f"sigma{sigma_tag}_seed{args.seed}_"
+                f"scenario{scenario_id}.xlsx"
+            )
+
+        output_path = output_dir / filename
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            gen_df.to_excel(
+                writer, sheet_name="nominal_dispatch", index=False
+            )
+            cont_df.to_excel(
+                writer, sheet_name="generator_contingencies", index=False
+            )
+            slack_df.to_excel(
+                writer, sheet_name="thermal_slacks", index=False
+            )
+            pd.DataFrame([{
+                "scenario_id": scenario_id,
+                "termination": str(term),
+                "objective": objective,
+                "gamma": args.gamma,
+                "line_contingencies": args.line_contingencies
+            }]).to_excel(
+                writer, sheet_name="summary", index=False
+            )
+
+        summary_records.append({
+            "scenario_id": scenario_id,
+            "termination": str(term),
+            "objective": objective
+        })
+
+        print(f"Objective: {objective:.6f}")
+        print(f"Saved: {output_path.name}")
+
+    # Save combined summary for all scenarios
+    summary_path = output_dir / f"p1_summary_{case_name}.xlsx"
+
+    pd.DataFrame(summary_records).to_excel(
+        summary_path,
+        index=False
+    )
+
+    print(f"\nCompleted {len(scenarios)} scenario attempts.")
+    print(f"Summary saved: {summary_path}")
+
     return 0
 
 
