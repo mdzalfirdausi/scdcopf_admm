@@ -1,0 +1,20 @@
+# Generated optimization results
+output/
+
+# Temporary Microsoft Excel files
+~$*.xlsx
+~$*.xls
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Solver-generated temporary files
+*.sol
+*.log
+*.lp
+*.mps
