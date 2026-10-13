@@ -225,6 +225,17 @@ def build_p1(case, include_lines=False):
     )
 
     # ============================================================
+    # mutable Pyomo parameters
+    # ============================================================
+    mdl.d = pyo.Param(
+        mdl.N,
+        initialize={
+            j: float(d[j])
+            for j in range(n)
+        },
+        mutable=True
+    )
+    # ============================================================
     # (1a): OBJECTIVE FUNCTION
     # Minimize nominal generation cost and thermal violations
     # ============================================================
@@ -249,16 +260,15 @@ def build_p1(case, include_lines=False):
         sense=pyo.minimize
     )
 
-    demand = float(d.sum())
-
     # ============================================================
     # (1b): NOMINAL POWER BALANCE
     # 1^T g = 1^T (d + omega)
     # ============================================================
 
     mdl.balance = pyo.Constraint(
-        expr=sum(mdl.g[i] for i in mdl.G) == demand
-    )
+                    expr=sum(mdl.g[i] for i in mdl.G)
+                    == sum(mdl.d[j] for j in mdl.N)
+                )
 
     # ============================================================
     # (1c): NOMINAL TRANSMISSION FLOW LIMITS
@@ -271,7 +281,7 @@ def build_p1(case, include_lines=False):
         rule=lambda mm, l:
         sum(
             float(K[l, j]) * (
-                float(d[j])
+                mm.d[j]
                 - sum(
                     float(B[j, i]) * mm.g[i]
                     for i in mm.G
@@ -309,10 +319,11 @@ def build_p1(case, include_lines=False):
     # ============================================================
 
     mdl.balance_k = pyo.Constraint(
-        mdl.Kg,
-        rule=lambda mm, k:
-        sum(mm.gk[k, i] for i in mm.G) == demand
-    )
+                    mdl.Kg,
+                    rule=lambda mm, k:
+                    sum(mm.gk[k, i] for i in mm.G)
+                    == sum(mm.d[j] for j in mm.N)
+                )
 
     # ============================================================
     # (1f): GENERATOR-CONTINGENCY TRANSMISSION LIMITS
@@ -326,7 +337,7 @@ def build_p1(case, include_lines=False):
         rule=lambda mm, k, l:
         sum(
             float(K[l, j]) * (
-                float(d[j])
+                mm.d[j]
                 - sum(
                     float(B[j, i]) * mm.gk[k, i]
                     for i in mm.G
@@ -506,7 +517,7 @@ def main():
 
     parser.add_argument('--case', required=True)
     # change gamma! if needed
-    parser.add_argument('--gamma', type=float, default=1)
+    parser.add_argument('--gamma', type=float, default=0.05)
     parser.add_argument('--m-eta', type=float, default=1500.0)
 
     parser.add_argument(
@@ -603,8 +614,6 @@ def main():
 
             scenarios = [(args.scenario_id, omega_all[args.scenario_id])]
 
-    print(f"Number of scenarios to solve: {len(scenarios)}")
-
     if args.sigma_scaling is None:
         print("Mode: Nominal SCDCOPF (omega = 0)")
     else:
@@ -642,22 +651,49 @@ def main():
 
     solver.options["MIPGap"] = args.mip_gap
 
+    # ============================================================
+    # BUILD P1 ONCE
+    # ============================================================
+
+    # Nominal demand in per unit
+    d_nominal = (
+        case["buses"]["Pd"].to_numpy(dtype=float)
+        / case["base"]
+    )
+
+    # Initialize the model with nominal demand
+    case["omega"] = np.zeros_like(d_nominal)
+
+    mdl, data = build_p1(
+        case,
+        include_lines=args.line_contingencies
+    )
+
+    # ============================================================
+    # SOLVE ALL SELECTED SCENARIOS
+    # ============================================================
+
     summary_records = []
 
     for scenario_id, omega in scenarios:
 
-        case["omega"] = np.asarray(omega, dtype=float)
-
-        print("\n" + "=" * 65)
-        print(f"Solving scenario: {scenario_id if scenario_id is not None else 'nominal'}")
-        print("=" * 65)
-
-        # Build a fresh P1 model for this uncertainty realization
-        mdl, data = build_p1(
-            case,
-            include_lines=args.line_contingencies
+        # Realized demand for this scenario
+        d_realized = d_nominal + np.asarray(
+            omega, dtype=float
         )
 
+        # Update mutable demand parameters
+        for j in mdl.N:
+            mdl.d[j].set_value(float(d_realized[j]))
+
+        print("\n" + "=" * 65)
+        print(
+            f"Solving scenario: "
+            f"{scenario_id if scenario_id is not None else 'nominal'}"
+        )
+        print("=" * 65)
+
+        # Solve the same Pyomo model with updated demand
         result = solver.solve(
             mdl,
             tee=args.tee,
@@ -782,7 +818,15 @@ def main():
         print(f"Saved: {output_path.name}")
 
     # Save combined summary for all scenarios
-    summary_path = output_dir / f"p1_summary_{case_name}.xlsx"
+    if args.sigma_scaling is None:
+        summary_name = f"p1_summary_{case_name}_nominal.xlsx"
+    else:
+        summary_name = (
+            f"p1_summary_{case_name}_"
+            f"sigma{sigma_tag}_seed{args.seed}.xlsx"
+        )
+
+    summary_path = output_dir / summary_name
 
     pd.DataFrame(summary_records).to_excel(
         summary_path,
