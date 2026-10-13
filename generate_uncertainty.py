@@ -39,7 +39,7 @@ def generate_uncertainty(
 
     output_path = (
         UNCERTAINTY_DIR /
-        f"omega_{case_name}_seed{seed}.npz"
+        f"omega_{case_name}_sigma{sigma_scaling}_seed{seed}.npz"
     )
 
     np.savez_compressed(

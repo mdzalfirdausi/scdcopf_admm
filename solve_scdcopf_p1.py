@@ -505,7 +505,8 @@ def main():
     )
 
     parser.add_argument('--case', required=True)
-    parser.add_argument('--gamma', type=float, default=0.05)
+    # change gamma! if needed
+    parser.add_argument('--gamma', type=float, default=1)
     parser.add_argument('--m-eta', type=float, default=1500.0)
 
     parser.add_argument(
@@ -560,15 +561,15 @@ def main():
     if args.sigma_scaling is None:
         # No uncertainty: solve the nominal case only
         scenarios = [(None, np.zeros(len(case["buses"])))]
-
     else:
-        sigma_tag = f"{args.sigma_scaling:.4f}".replace(".", "p")
+        sigma_tag = f"{args.sigma_scaling:g}"
 
         uncertainty_path = (
             Path(__file__).resolve().parent
             / "uncertainty"
             / f"omega_{case_path.stem}_sigma{sigma_tag}_seed{args.seed}.npz"
         )
+
 
         if not uncertainty_path.is_file():
             parser.error(f"Uncertainty file not found: {uncertainty_path}")
@@ -612,14 +613,24 @@ def main():
         print(f"Sigma scaling: {args.sigma_scaling}")
 
     print(f"Number of scenarios to solve: {len(scenarios)}")
+    
+    # ============================================================
+    # OUTPUT DIRECTORY FOR EACH TEST CASE
+    # ============================================================
+
+    case_name = case_path.stem
+
+    output_dir = (
+        Path(__file__).resolve().parent
+        / args.output_dir
+        / case_name
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # ============================================================
     # SOLVE ALL SELECTED SCENARIOS
     # ============================================================
-
-    output_dir = Path(__file__).resolve().parent / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    case_name = case_path.stem
 
     solver = pyo.SolverFactory("gurobi")
 
