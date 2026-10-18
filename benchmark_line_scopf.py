@@ -462,7 +462,7 @@ def solve_admm(case, scenes, args, scale):
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--case', required=True)
-    p.add_argument('--case-dir', default=r'M:\projects\excel_outputs')
+    p.add_argument('--case-dir', default=r'../excel_outputs')
     p.add_argument('--output-dir', default='output_line_scopf')
     p.add_argument('--method', choices=['central', 'admm', 'both'], default='both')
     p.add_argument('--cost', choices=['linear', 'quadratic'], default='linear')
