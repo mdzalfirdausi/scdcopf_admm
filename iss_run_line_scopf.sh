@@ -73,8 +73,6 @@ if [[ ! -f benchmark_line_scopf.py ]]; then
 fi
 
 # Use the environment initialization from your ISS example.
-module purge
-module load gurobi/13.0.1
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate pytorch
 set -u
@@ -105,20 +103,8 @@ echo "Python: $(command -v python)"
 echo "Output: $OUT_DIR"
 echo "Start time: $(date)"
 echo "============================================"
-module list 2>&1
 
-# Fail before reading/building the case if ISS cannot provide a Gurobi license.
-# This tests one environment; the subsequent parallel run must also have access
-# to enough environments for its requested workers.
-srun --ntasks=1 --cpus-per-task=1 --cpu-bind=cores \
-    python -u - <<'PYLICENSE'
-import gurobipy as gp
-print("Gurobi version:", gp.gurobi.version(), flush=True)
-with gp.Env(empty=True) as env:
-    env.setParam("OutputFlag", 0)
-    env.start()
-    print("Gurobi license test: OK", flush=True)
-PYLICENSE
+python --version
 
 # All benchmark input loading, matrix/model building and solving takes place
 # inside this compute-node step. Both methods receive the allocated CPU budget.
