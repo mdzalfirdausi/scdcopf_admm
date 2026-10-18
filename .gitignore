@@ -1,6 +1,8 @@
 # Generated optimization results
 output/
 uncertainty/
+output_line_compare/
+output_line_joint/
 
 # Temporary Microsoft Excel files
 ~$*.xlsx
