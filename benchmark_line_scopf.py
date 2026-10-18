@@ -546,7 +546,7 @@ def parser():
     p.add_argument('--cost', choices=['linear', 'quadratic'], default='linear')
     p.add_argument('--thermal-mode', choices=['hard', 'soft'], default='hard')
     p.add_argument('--penalty', type=float, default=1500.0, help='Cost per unit eta (NOT per MW) in soft mode')
-    p.add_argument('--islanding', choices=['error', 'skip'], default='error')
+    p.add_argument('--islanding', choices=['error', 'skip'], default='skip')
     p.add_argument('--lp-solver', choices=['highs', 'gurobi'], default='highs')
     p.add_argument('--qp-solver', choices=['auto', 'osqp', 'gurobi', 'scipy'], default='auto')
     p.add_argument('--rho', type=float, default=1.0, help='Fixed ADMM rho for scaled objective, per-unit dispatch')
