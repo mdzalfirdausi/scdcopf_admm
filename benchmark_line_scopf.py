@@ -555,7 +555,7 @@ def parser():
     p.add_argument('--inner-tol', type=float, default=1e-9)
     p.add_argument('--feas-tol-mw', type=float, default=1e-4)
     p.add_argument('--max-iter', type=int, default=5000)
-    p.add_argument('--workers', type=positive_or_auto, default=1,
+    p.add_argument('--workers', type=positive_or_auto, default='auto',
                    help='Parallel scenario workers; auto = min(scenarios, CPU budget / QP threads)')
     p.add_argument('--cpu-budget', type=positive_or_auto, default='auto',
                    help='Logical CPU budget for automatic worker allocation; default uses process affinity')
