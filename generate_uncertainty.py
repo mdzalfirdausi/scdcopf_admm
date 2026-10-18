@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-EXCEL_DIR = Path(r"M:\projects\excel_outputs")
+EXCEL_DIR = Path(r"../excel_outputs")
 UNCERTAINTY_DIR = Path(__file__).resolve().parent / "uncertainty"
 
 
