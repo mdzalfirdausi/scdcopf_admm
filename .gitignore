@@ -3,6 +3,7 @@ output/
 uncertainty/
 output_line_compare/
 output_line_joint/
+output_line_parallel/
 
 # Temporary Microsoft Excel files
 ~$*.xlsx
