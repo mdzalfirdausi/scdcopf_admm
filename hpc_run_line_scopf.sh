@@ -70,6 +70,7 @@ module purge
 module load gurobi/13.0.1
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate pytorch
+gurobi_cl --license
 set -u
 
 # Each ADMM worker receives one Gurobi solver thread. Do not also allow each
