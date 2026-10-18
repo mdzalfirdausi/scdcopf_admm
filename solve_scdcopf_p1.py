@@ -835,6 +835,126 @@ def main():
             ]
         )
 
+
+        # ============================================================
+        # CENTRALIZED CONTINUOUS-RELAXATION EXPERIMENT
+        # ============================================================
+
+        relaxed = mdl.clone()
+
+        # Change only the binary domains: {0, 1} --> [0, 1].
+        for k, i in relaxed.XK:
+            relaxed.xk[k, i].domain = pyo.UnitInterval
+            relaxed.xk[k, i].setlb(0.0)
+            relaxed.xk[k, i].setub(1.0)
+
+        lp_result = solver.solve(
+            relaxed,
+            tee=args.tee,
+            load_solutions=False
+        )
+
+        print("\nCONTINUOUS-RELAXATION EXPERIMENT")
+        print("LP termination:", lp_result.solver.termination_condition)
+
+        if lp_result.solver.termination_condition == TerminationCondition.optimal:
+            relaxed.solutions.load_from(lp_result)
+
+            milp_objective = pyo.value(mdl.obj)
+            lp_objective = pyo.value(relaxed.obj)
+
+            print(f"MILP objective: {milp_objective:.8f}")
+            print(f"LP objective:   {lp_objective:.8f}")
+            print(f"Objective difference: {milp_objective - lp_objective:.8f}")
+
+            g_lp = np.array([
+                pyo.value(relaxed.g[i]) for i in relaxed.G
+            ])
+
+            response = args.gamma * (data["hi"] - data["lo"])
+
+            for k in relaxed.Kg:
+                y_k = np.array([
+                    pyo.value(relaxed.gk[k, i]) for i in relaxed.G
+                ])
+                z_k = pyo.value(relaxed.zk[k])
+
+                # Physical APR outputs at the CURRENT relaxed signal.
+                apr_at_current_signal = np.minimum(
+                    g_lp + z_k * response,
+                    data["hi"]
+                )
+                apr_at_current_signal[k] = 0.0
+
+                delta_MW = (
+                    np.abs(y_k - apr_at_current_signal).sum()
+                    * data["base"]
+                )
+
+                x_values = [
+                    pyo.value(relaxed.xk[k, i])
+                    for i in relaxed.G if i != k
+                ]
+
+                print(
+                    f"Contingency {k}: "
+                    f"z_LP={z_k:.8f}, "
+                    f"x_LP={x_values}, "
+                    f"APR inconsistency={delta_MW:.8e} MW"
+                )
+
+                # Recover a BALANCING physical response at the LP dispatch.
+                demand_lp = sum(
+                    pyo.value(relaxed.d[j]) for j in relaxed.N
+                )
+
+                p_k, z_recovered, _, feasible = apr_binary_search(
+                    g=g_lp,
+                    gmin=data["lo"],
+                    gmax=data["hi"],
+                    gamma=args.gamma,
+                    k=k,
+                    demand=demand_lp
+                )
+
+                if not feasible:
+                    print(
+                        f"Contingency {k}: physical recovery failed "
+                        "at the LP preventive dispatch"
+                    )
+                    continue
+
+                recovery_change_MW = (
+                    np.abs(p_k - y_k).sum() * data["base"]
+                )
+
+                # Centralized experiment: dispatch copies do not exist,
+                # so r_k = 0 and the theoretical bound is 2 * delta_k.
+                bound_MW = 2.0 * delta_MW
+
+                # Account for numerical balance residuals.
+                numerical_allowance_MW = (
+                    abs(y_k.sum() - demand_lp)
+                    + abs(p_k.sum() - demand_lp)
+                ) * data["base"]
+
+                print("  LP outputs [MW]:",
+                      np.round(y_k * data["base"], 8))
+                print("  APR at LP signal [MW]:",
+                      np.round(apr_at_current_signal * data["base"], 8))
+                print("  Recovered outputs [MW]:",
+                      np.round(p_k * data["base"], 8))
+                print(f"  Recovered signal: {z_recovered:.8f}")
+                print(f"  Actual recovery change: "
+                      f"{recovery_change_MW:.8e} MW")
+                print(f"  Theoretical bound 2*delta: "
+                      f"{bound_MW:.8e} MW")
+                print("  Bound satisfied within numerical allowance:",
+                      recovery_change_MW
+                      <= bound_MW + numerical_allowance_MW + 1e-7)
+        else:
+            print("An optimal LP solution was not obtained; comparison skipped.")
+
         # Save each scenario independently
         if scenario_id is None:
             filename = f"p1_solution_{case_name}_nominal.xlsx"

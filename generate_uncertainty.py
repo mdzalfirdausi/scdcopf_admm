@@ -83,24 +83,24 @@ if __name__ == "__main__":
 
     # Optional arguments
     parser.add_argument(
-        "--n-scenarios",
+        "--scenarios",
         type=int,
         default=3,
-        help="Number of uncertainty scenarios (default: 100)"
+        help="Number of uncertainty scenarios (default: 3)"
     )
 
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed (default: 42)"
+        default=19,
+        help="Random seed (default: 19)"
     )
 
     args = parser.parse_args()
 
     generate_uncertainty(
         case_name=args.case,
-        n_scenarios=args.n_scenarios,
+        n_scenarios=args.scenarios,
         sigma_scaling=args.sigma_scaling,
         seed=args.seed
     )
