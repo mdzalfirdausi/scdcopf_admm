@@ -1,0 +1,78 @@
+============================================
+Job ID: 14265
+Batch node: issnode2
+CPUs: 16
+Case: pglib_opf_case118_ieee.xlsx
+Mode: soft; islanding policy: skip; repeats: 1
+Environment: pytorch
+Python: /nfs/mfirdausi/miniconda3/envs/pytorch/bin/python
+Output: /nfs/mfirdausi/project/scdcopf_admm/output_iss/pglib_opf_case118_ieee_soft_14265
+Start time: Sun Oct 18 01:36:44 PM +03 2026
+============================================
+Python 3.11.15
+Case: pglib_opf_case118_ieee.xlsx; demand=4242 MW; generators=19
+Line contingencies=177; excluded islanding=9; thermal mode=soft
+Generation cost=linear; shared preprocessing=0.703518 s; objective scale=12458.2
+CPU budget=16; ADMM workers=16; QP threads=1; central Gurobi threads=16
+Run 1: central
+  status=optimal; total=0.586039 s; objective=103887.19242886; max overload=80.2828 MW
+  Convex centralized model solved
+Run 1: admm
+  ADMM 1: r=0.239, s=0.0668, common-dispatch overload=85.8289 MW
+  ADMM 100: r=0.000399, s=0.0501, common-dispatch overload=82.2812 MW
+  ADMM 200: r=0.000232, s=0.0441, common-dispatch overload=80.5907 MW
+  ADMM 300: r=0.00577, s=0.0418, common-dispatch overload=78.6285 MW
+  ADMM 400: r=0.0012, s=0.0261, common-dispatch overload=76.7043 MW
+  ADMM 500: r=0.00144, s=0.026, common-dispatch overload=74.5825 MW
+  ADMM 600: r=0.00247, s=0.0206, common-dispatch overload=74.3643 MW
+  ADMM 700: r=0.0003, s=0.0203, common-dispatch overload=74.5792 MW
+  ADMM 800: r=0.00153, s=0.0201, common-dispatch overload=74.8587 MW
+  ADMM 900: r=0.001, s=0.0188, common-dispatch overload=75.244 MW
+  ADMM 1000: r=0.00108, s=0.0187, common-dispatch overload=75.7279 MW
+  ADMM 1100: r=0.00118, s=0.0179, common-dispatch overload=76.2744 MW
+  ADMM 1200: r=0.000731, s=0.0179, common-dispatch overload=77.0173 MW
+  ADMM 1300: r=0.000158, s=0.0179, common-dispatch overload=77.761 MW
+  ADMM 1400: r=0.00304, s=0.0176, common-dispatch overload=78.4608 MW
+  ADMM 1500: r=0.000471, s=0.017, common-dispatch overload=78.9918 MW
+  ADMM 1600: r=0.000387, s=0.0163, common-dispatch overload=79.761 MW
+  ADMM 1700: r=4.88e-05, s=0.0155, common-dispatch overload=80.2402 MW
+  ADMM 1800: r=0.000439, s=0.0154, common-dispatch overload=80.6798 MW
+  ADMM 1900: r=0.000497, s=0.0154, common-dispatch overload=81.1215 MW
+  ADMM 2000: r=0.000264, s=0.0154, common-dispatch overload=81.5641 MW
+  ADMM 2100: r=0.000379, s=0.0131, common-dispatch overload=81.9734 MW
+  ADMM 2200: r=0.00382, s=0.00982, common-dispatch overload=81.8897 MW
+  ADMM 2300: r=0.00381, s=0.0081, common-dispatch overload=81.8637 MW
+  ADMM 2400: r=0.000861, s=0.00709, common-dispatch overload=81.7362 MW
+  ADMM 2500: r=0.000383, s=0.00707, common-dispatch overload=81.6094 MW
+  ADMM 2600: r=0.0017, s=0.00711, common-dispatch overload=81.4798 MW
+  ADMM 2700: r=0.000207, s=0.00705, common-dispatch overload=81.3503 MW
+  ADMM 2800: r=0.000173, s=0.00705, common-dispatch overload=81.2205 MW
+  ADMM 2900: r=0.00208, s=0.00567, common-dispatch overload=81.1466 MW
+  ADMM 3000: r=0.00131, s=0.00558, common-dispatch overload=81.1257 MW
+  ADMM 3100: r=0.00075, s=0.0055, common-dispatch overload=81.1043 MW
+  ADMM 3200: r=0.000438, s=0.00544, common-dispatch overload=81.0833 MW
+  ADMM 3300: r=0.000267, s=0.00542, common-dispatch overload=81.0623 MW
+  ADMM 3400: r=0.000283, s=0.00541, common-dispatch overload=81.0413 MW
+  ADMM 3500: r=0.000143, s=0.00541, common-dispatch overload=81.0203 MW
+  ADMM 3600: r=0.000113, s=0.00541, common-dispatch overload=80.9991 MW
+  ADMM 3700: r=0.000295, s=0.00541, common-dispatch overload=80.9777 MW
+  ADMM 3800: r=9.51e-05, s=0.00541, common-dispatch overload=80.9564 MW
+  ADMM 3900: r=0.000154, s=0.00516, common-dispatch overload=80.95 MW
+  ADMM 4000: r=6.39e-05, s=0.00515, common-dispatch overload=80.9459 MW
+  ADMM 4100: r=6.52e-05, s=0.00515, common-dispatch overload=80.9416 MW
+  ADMM 4200: r=3.59e-05, s=0.00515, common-dispatch overload=80.9369 MW
+  ADMM 4300: r=7.62e-05, s=0.00515, common-dispatch overload=80.9322 MW
+  ADMM 4400: r=1.81e-05, s=0.00515, common-dispatch overload=80.9274 MW
+  ADMM 4500: r=1.24e-05, s=0.00515, common-dispatch overload=80.9227 MW
+  ADMM 4600: r=1.12e-05, s=0.00515, common-dispatch overload=80.918 MW
+  ADMM 4700: r=1.84e-05, s=0.00515, common-dispatch overload=80.9134 MW
+  ADMM 4800: r=0.000988, s=0.00503, common-dispatch overload=80.9081 MW
+  ADMM 4900: r=0.00125, s=0.00464, common-dispatch overload=80.8186 MW
+  ADMM 5000: r=0.000961, s=0.00458, common-dispatch overload=80.7301 MW
+  status=iteration_limit; total=138.584454 s; objective=104260.93162352; max overload=80.7301 MW
+  ADMM iteration limit reached
+ run  method          status  workers  solver_threads  total_seconds  iterations     objective  max_overload_MW  zero_overload_secure  relative_objective_difference
+   1 central         optimal        1              16       0.586039           0 103887.192429        80.282819                 False                       0.000000
+   1    admm iteration_limit       16               1     138.584454        5000 104260.931624        80.730148                 False                       0.003598
+Saved results: /nfs/mfirdausi/project/scdcopf_admm/output_iss/pglib_opf_case118_ieee_soft_14265
+Finished: Sun Oct 18 01:39:08 PM +03 2026 | Exit code: 2

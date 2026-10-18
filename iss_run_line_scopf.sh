@@ -27,13 +27,15 @@ trap 'job_status=$?; echo "Finished: $(date) | Exit code: $job_status"' EXIT
 
 CASE_NAME=""
 CASE_DIR="../excel_outputs"
-THERMAL_MODE="hard"
+THERMAL_MODE="soft"
 ISLANDING="error"
 REPEATS=1
+LP_SOLVER="gurobi"
+QP_SOLVER="gurobi"
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --case|--case-dir|--thermal-mode|--islanding|--repeat)
+        --case|--case-dir|--thermal-mode|--islanding|--repeat|--lp-solver|--qp-solver)
             if [[ "$#" -lt 2 || -z "$2" || "$2" == --* ]]; then
                 echo "ERROR: $1 requires a value." >&2
                 exit 1
@@ -44,6 +46,8 @@ while [[ "$#" -gt 0 ]]; do
                 --thermal-mode) THERMAL_MODE="$2" ;;
                 --islanding) ISLANDING="$2" ;;
                 --repeat) REPEATS="$2" ;;
+                --lp-solver) LP_SOLVER="$2" ;;
+                --qp-solver) QP_SOLVER="$2" ;;
             esac
             shift 2
             ;;
@@ -113,8 +117,8 @@ srun --ntasks=1 --cpus-per-task="$CPU_BUDGET" --cpu-bind=cores \
     --case "$CASE_NAME" \
     --case-dir "$CASE_DIR" \
     --method both \
-    --lp-solver gurobi \
-    --qp-solver gurobi \
+    --lp-solver "$LP_SOLVER" \
+    --qp-solver "$QP_SOLVER" \
     --workers auto \
     --qp-threads 1 \
     --cpu-budget "$CPU_BUDGET" \
