@@ -7,6 +7,7 @@ preventive dispatch must work in the base case and every included scenario.
 
 Install: python -m pip install numpy pandas scipy openpyxl osqp
 Run: python benchmark_line_scopf.py --case pglib_opf_case5_pjm.xlsx --repeat 3
+Parallel: add --workers auto --qp-solver gurobi (or osqp).
 
 Default: hard thermal limits, linear c1 generation costs (c2 explicitly ignored,
 as in the original P1 script). --cost quadratic retains nonnegative c2 values.
@@ -38,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib.util
 import json
+import os
 from pathlib import Path
 import platform
 import sys
@@ -179,7 +181,7 @@ def scenario_constraints(case, scene, soft):
 
 class QP:
     """Reusable convex QP with diagonal Hessian and changing linear objective."""
-    def __init__(self, diagonal, q, A, lower, upper, backend, tol):
+    def __init__(self, diagonal, q, A, lower, upper, backend, tol, threads=1, env=None):
         self.diagonal, self.q = diagonal, q.copy()
         self.A, self.lower, self.upper, self.backend = A, lower, upper, backend
         self.last = None
@@ -193,11 +195,10 @@ class QP:
         elif backend == 'gurobi':
             import gurobipy as gp
             self.gp = gp
-            self.env = gp.Env(empty=True)
-            self.env.setParam('OutputFlag', 0)
-            self.env.start()
+            self.owns_env = env is None
+            self.env = env if env is not None else create_gurobi_env()
             self.model = gp.Model(env=self.env)
-            self.model.Params.Threads = 1
+            self.model.Params.Threads = threads
             self.model.Params.FeasibilityTol = max(tol, 1e-9)
             self.model.Params.OptimalityTol = max(tol, 1e-9)
             self.v = self.model.addMVar(len(q), lb=-gp.GRB.INFINITY)
@@ -267,7 +268,41 @@ class QP:
     def close(self):
         if self.backend == 'gurobi':
             self.model.dispose()
-            self.env.dispose()
+            if self.owns_env:
+                self.env.dispose()
+
+
+def create_gurobi_env():
+    """Called only on the main thread, including during parallel ADMM setup."""
+    import gurobipy as gp
+    env = gp.Env(empty=True)
+    try:
+        env.setParam('OutputFlag', 0)
+        env.start()
+    except Exception:
+        env.dispose()
+        raise
+    return env
+
+
+def available_cpus():
+    """Respect the current process CPU affinity where the OS exposes it."""
+    if hasattr(os, 'sched_getaffinity'):
+        return max(1, len(os.sched_getaffinity(0)))
+    process_count = getattr(os, 'process_cpu_count', os.cpu_count)
+    return max(1, process_count() or 1)
+
+
+def positive_or_auto(value):
+    if str(value).lower() == 'auto':
+        return 'auto'
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError('Use a positive integer or auto') from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError('Use a positive integer or auto')
+    return number
 
 
 def choose_qp_backend(requested):
@@ -371,7 +406,7 @@ def solve_central(case, scenes, args, scale):
         upper = np.r_[case['hi'], np.full(ne, np.inf), case['D'], rhs]
         diagonal = np.r_[2 * case['gen'].c2.to_numpy(float) * case['base'] ** 2
                          if args.cost == 'quadratic' else np.zeros(ng), np.zeros(ne)] / scale
-        qp = QP(diagonal, q, A, lower, upper, backend, args.inner_tol)
+        qp = QP(diagonal, q, A, lower, upper, backend, args.inner_tol, threads=args.central_threads)
         setup_seconds = perf_counter() - started
         t = perf_counter()
         try:
@@ -384,7 +419,8 @@ def solve_central(case, scenes, args, scale):
     return dict(method='central', status=status, message=message, backend=backend, iterations=0,
                 setup_seconds=setup_seconds, solve_seconds=solve_seconds,
                 total_seconds=perf_counter() - started, cpu_seconds=process_time() - cpu,
-                variables=ng + ne, thermal_inequalities=2 * len(rates), workers=1), \
+                variables=ng + ne, thermal_inequalities=2 * len(rates), workers=1,
+                solver_threads=args.central_threads if backend == 'gurobi' else None), \
         (None if vector is None else vector[:ng]), []
 
 
@@ -395,27 +431,66 @@ def solve_admm(case, scenes, args, scale):
                             case['lo'], case['hi'], case['D'])
     x = np.tile(z, (ns, 1))
     u = np.zeros_like(x)
-    models, linear_costs, starts = [], [], []
-    for scene in scenes:
-        A, lower, upper = scenario_constraints(case, scene, soft)
-        ne = len(scene.monitored) if soft else 0
-        q = np.r_[np.zeros(ng), np.full(ne, args.penalty / scale)]
-        diagonal = np.r_[np.full(ng, args.rho), np.zeros(ne)]
-        models.append(QP(diagonal, q, A, lower, upper, args.qp_backend, args.inner_tol))
-        linear_costs.append(q)
-        starts.append(np.r_[z, np.maximum(np.abs(scene.F @ z + scene.offset) - scene.rates, 0)] if soft else z)
-    executor = ThreadPoolExecutor(max_workers=args.workers) if args.workers > 1 else None
+    models, linear_costs, starts, environments, executors = [], [], [], [], []
+    # A worker always handles the SAME group of scenarios. Models in that group
+    # share one environment, exclusively used by that worker. Create/dispose all
+    # Gurobi environments on the main thread, per Gurobi's threading guidance.
+    groups = [list(range(w, ns, args.workers)) for w in range(args.workers)]
+    try:
+        if args.qp_backend == 'gurobi':
+            for _ in groups:
+                environments.append(create_gurobi_env())
+        for j, scene in enumerate(scenes):
+            A, lower, upper = scenario_constraints(case, scene, soft)
+            ne = len(scene.monitored) if soft else 0
+            q = np.r_[np.zeros(ng), np.full(ne, args.penalty / scale)]
+            diagonal = np.r_[np.full(ng, args.rho), np.zeros(ne)]
+            env = environments[j % args.workers] if environments else None
+            models.append(QP(diagonal, q, A, lower, upper, args.qp_backend, args.inner_tol,
+                             threads=args.qp_threads, env=env))
+            linear_costs.append(q)
+            starts.append(np.r_[z, np.maximum(np.abs(scene.F @ z + scene.offset) - scene.rates, 0)] if soft else z)
+        if args.workers > 1:
+            for _ in groups:
+                pool = ThreadPoolExecutor(max_workers=1)
+                executors.append(pool)
+                pool.submit(lambda: None).result()  # Charge thread startup to setup.
+    except Exception:
+        for pool in executors:
+            pool.shutdown(wait=True)
+        for model in models:
+            model.close()
+        for env in environments:
+            env.dispose()
+        raise
     setup_seconds = perf_counter() - started
     history, status, message = [], 'iteration_limit', 'ADMM iteration limit reached'
     t = perf_counter()
     iteration = 0
     try:
         for iteration in range(1, args.max_iter + 1):
-            def update(j):
-                q = linear_costs[j].copy()
-                q[:ng] = -args.rho * (z - u[j])
-                return models[j].solve(q, starts[j])[:ng]
-            x = np.asarray(list(executor.map(update, range(ns))) if executor else [update(j) for j in range(ns)])
+            def update_group(indices):
+                values = []
+                for j in indices:
+                    q = linear_costs[j].copy()
+                    q[:ng] = -args.rho * (z - u[j])
+                    values.append((j, models[j].solve(q, starts[j])[:ng]))
+                return values
+            if executors:
+                futures = [pool.submit(update_group, group) for pool, group in zip(executors, groups)]
+                # Wait for ALL workers even if one fails before cleaning up.
+                results, failure = [], None
+                for future in futures:
+                    try:
+                        results.extend(future.result())
+                    except Exception as exc:
+                        failure = failure or exc
+                if failure is not None:
+                    raise RuntimeError(f'Parallel QP update failed: {failure}') from failure
+            else:
+                results = update_group(groups[0])
+            for j, value in results:
+                x[j] = value
             previous = z.copy()
             curvature = (2 * case['gen'].c2.to_numpy(float) * case['base'] ** 2 / scale
                          if args.cost == 'quadratic' else np.zeros(ng))
@@ -444,10 +519,12 @@ def solve_admm(case, scenes, args, scale):
     except RuntimeError as exc:
         status, message = 'subproblem_failed', str(exc)
     finally:
-        if executor:
-            executor.shutdown(wait=True)
+        for pool in executors:
+            pool.shutdown(wait=True)
         for model in models:
             model.close()
+        for env in environments:
+            env.dispose()
     solve_seconds = perf_counter() - t
     final = history[-1] if history else {}
     return dict(method='admm', status=status, message=message, backend=args.qp_backend, iterations=iteration,
@@ -455,6 +532,7 @@ def solve_admm(case, scenes, args, scale):
                 total_seconds=perf_counter() - started, cpu_seconds=process_time() - cpu,
                 variables=sum(len(q) for q in linear_costs) + ng,
                 thermal_inequalities=2 * sum(len(s.monitored) for s in scenes), workers=args.workers,
+                solver_threads=args.qp_threads if args.qp_backend == 'gurobi' else 1,
                 primal_residual_pu=final.get('primal_residual_pu'),
                 dual_residual_scaled=final.get('dual_residual_scaled')), z, history
 
@@ -462,7 +540,7 @@ def solve_admm(case, scenes, args, scale):
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--case', required=True)
-    p.add_argument('--case-dir', default=r'../excel_outputs')
+    p.add_argument('--case-dir', default='../excel_outputs')
     p.add_argument('--output-dir', default='output_line_scopf')
     p.add_argument('--method', choices=['central', 'admm', 'both'], default='both')
     p.add_argument('--cost', choices=['linear', 'quadratic'], default='linear')
@@ -477,7 +555,14 @@ def parser():
     p.add_argument('--inner-tol', type=float, default=1e-9)
     p.add_argument('--feas-tol-mw', type=float, default=1e-4)
     p.add_argument('--max-iter', type=int, default=5000)
-    p.add_argument('--workers', type=int, default=1)
+    p.add_argument('--workers', type=positive_or_auto, default=1,
+                   help='Parallel scenario workers; auto = min(scenarios, CPU budget / QP threads)')
+    p.add_argument('--cpu-budget', type=positive_or_auto, default='auto',
+                   help='Logical CPU budget for automatic worker allocation; default uses process affinity')
+    p.add_argument('--qp-threads', type=int, default=1,
+                   help='Gurobi threads per scenario QP; 1 recommended for small QPs')
+    p.add_argument('--central-threads', type=positive_or_auto, default=1,
+                   help='Gurobi threads for the central LP/QP; auto uses the same CPU budget')
     p.add_argument('--repeat', type=int, default=1)
     p.add_argument('--log-every', type=int, default=100)
     p.add_argument('--demand-scale', type=float, default=1.0)
@@ -489,8 +574,8 @@ def main():
     for name in ('rho', 'abs_tol', 'rel_tol', 'inner_tol', 'feas_tol_mw', 'penalty', 'demand_scale'):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f'{name} must be positive and finite')
-    if min(args.repeat, args.workers, args.max_iter) < 1 or args.log_every < 0:
-        raise ValueError('repeat, workers, max-iter must be positive; log-every nonnegative')
+    if min(args.repeat, args.qp_threads, args.max_iter) < 1 or args.log_every < 0:
+        raise ValueError('repeat, qp-threads, max-iter must be positive; log-every nonnegative')
     path = resolve_case(args.case, args.case_dir)
     t = perf_counter()
     case = load_case(path, args.demand_scale)
@@ -507,16 +592,26 @@ def main():
         raise ValueError(f'{len(excluded)} islanding line outages found. See excluded_outages.csv. '
                          'Use --islanding skip only to study the non-islanding subset explicitly.')
     args.qp_backend = choose_qp_backend(args.qp_solver)
+    cpu_count = available_cpus()
+    args.cpu_budget = min(cpu_count, cpu_count if args.cpu_budget == 'auto' else args.cpu_budget)
+    if args.qp_backend != 'gurobi' and args.qp_threads != 1:
+        raise ValueError('--qp-threads applies only to Gurobi; use 1 for other backends')
+    if args.qp_threads > args.cpu_budget:
+        raise ValueError('--qp-threads exceeds the CPU budget')
+    args.workers_requested = args.workers
+    maximum_workers = min(len(scenes), args.cpu_budget // args.qp_threads)
+    args.workers = maximum_workers if args.workers == 'auto' else min(args.workers, maximum_workers)
+    args.central_threads = args.cpu_budget if args.central_threads == 'auto' else min(args.central_threads, args.cpu_budget)
     if args.qp_backend == 'scipy' and (args.method != 'central' or args.cost == 'quadratic'):
         print('NOTE: SciPy SLSQP fallback is for small-case verification. Install osqp or use --qp-solver gurobi for timing studies.')
-    if args.workers > 1 and args.qp_backend == 'gurobi':
-        raise ValueError('Use --workers 1 with Gurobi in this first version; use OSQP for threaded local QPs')
     c1 = case['gen'].c1.to_numpy(float) * case['base']
     curvature = case['gen'].c2.to_numpy(float) * case['base'] ** 2 if args.cost == 'quadratic' else np.zeros(len(c1))
     scale = float(max(1.0, max0(np.abs(c1)), max0(np.abs(curvature)), args.penalty if args.thermal_mode == 'soft' else 0.0))
     print(f"Case: {path.name}; demand={case['D'] * case['base']:.6g} MW; generators={len(c1)}")
     print(f"Line contingencies={len(scenes)-1}; excluded islanding={len(excluded)}; thermal mode={args.thermal_mode}")
     print(f"Generation cost={args.cost}; shared preprocessing={preprocessing:.6f} s; objective scale={scale:g}")
+    print(f"CPU budget={args.cpu_budget}; ADMM workers={args.workers}; QP threads={args.qp_threads}; "
+          f"central Gurobi threads={args.central_threads}")
     if args.cost == 'linear' and np.any(case['gen'].c2.to_numpy(float) != 0):
         print('NOTE: nonzero c2 is ignored in linear mode, matching your existing linear P1 objective.')
     rows, dispatch_rows, flow_rows = [], [], []
@@ -585,10 +680,10 @@ def main():
                     backend_versions=backend_versions,
                     objective_scale=scale, case_path=str(path), generation_contingencies=0,
                     timing='Cold runs; shared input/PTDF preprocessing excluded from per-method total; validation separate',
-                    parallelism='Actual threaded local QP execution; central HiGHS uses its own default threading',
+                    parallelism='Fixed scenario groups per worker; Gurobi environment per worker; central HiGHS uses its own default threading',
                     security_scope='Base case plus all NON-ISLANDING single-line outages; rateA <= 0 means unmonitored')
     (output / 'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
-    cols = [c for c in ['run', 'method', 'status', 'total_seconds', 'iterations', 'objective',
+    cols = [c for c in ['run', 'method', 'status', 'workers', 'solver_threads', 'total_seconds', 'iterations', 'objective',
                         'max_overload_MW', 'zero_overload_secure', 'relative_objective_difference'] if c in summary]
     print(summary[cols].to_string(index=False))
     print(f'Saved results: {output.resolve()}')
