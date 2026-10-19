@@ -13,7 +13,12 @@ Slacks default to SOFT, nonnegative, with no upper bounds.
 NEW: --budget-increase 0.10 enables the professor's cost-budget experiment.
 First solve a reference OPF without generator outages (--reference-opf line,
 the default, or nominal). Then enforce ORIGINAL generation cost + ALL thermal
-penalties <= 1.10 * reference cost, and minimize thermal penalties + W*sum(z).
+penalties <= 1.10 * reference cost, and minimize sum(z) by default.
+This is the professor's revised objective: thermal penalties remain ONLY in
+the cost budget. --budget-objective thermal-signal restores the earlier
+minimization of thermal penalties + W*sum(z). In signal-only mode W is fixed
+to 1; multiplying the sole objective by any positive W cannot select a
+different optimal set, so no W sweep or W=0 budget candidate is performed.
 The preventive dispatch is optimized again, not fixed to the reference OPF.
 --reference-cost VALUE reuses a previously computed cost and skips that solve;
 its external solve time is then excluded and must be reported separately.
@@ -43,7 +48,7 @@ Small modified test (original case5 demand 1000 MW is generator-N-1 infeasible):
 Cost-budget example, including non-islanding line contingencies:
  python check_apr_signal_penalty.py --case pglib_opf_case5_pjm.xlsx \
    --gamma 1 --demand-scale 0.9 --solver highs --thermal-mode soft \
-   --budget-increase 0.10 --reference-opf line --weights 1 100 1000 \
+   --budget-increase 0.10 --reference-opf line --budget-objective signal \
    --compare-exact --output-dir output_apr_budget_case5
 
 Input Excel schema: baseMVA, bus, gen, gencost, branch, matching the P1 script.
@@ -257,19 +262,27 @@ def build_model(case, outages, args, exact=False, fixed=None):
         integrality.extend([integer] * low.size)
         return index
 
+    # LaTeX (bounds): \underline{g}_i \le g_i \le \overline{g}_i.
+    # If --fixed-dispatch is supplied: g_i = g_i^{fixed} instead.
+    # LaTeX (original generation cost): C_g = c^T g + C_0.
+    # g is per unit, so c_i = c_{1,i} * baseMVA; C_0 is added separately.
     g = variables(case['lo'] if fixed is None else fixed, case['hi'] if fixed is None else fixed,
                   case['gen'].c1.to_numpy(float) * case['base'])
     y = np.empty((nk, ng), dtype=int)
     for s, k in enumerate(outages):
+        # LaTeX: \underline{g}_i \le g_{k,i} \le \overline{g}_i, i\ne k.
         low, high = case['lo'].copy(), case['hi'].copy()
+        # LaTeX: g_{k,k}=0 (the outaged generator).
         low[k] = high[k] = 0.0
         y[s] = variables(low, high)
+    # LaTeX: 0 \le z_k \le 1, k\in\mathcal{K}_g.
     z = variables(np.zeros(nk), np.ones(nk))
     x = {}
     if exact:
         for s, k in enumerate(outages):
             for i in range(ng):
                 if i != k:
+                    # LaTeX: x_{k,i}\in\{0,1\}; exact MILP benchmark ONLY.
                     x[s, i] = int(variables(0.0, 1.0, integer=1)[0])
 
     row, col, data, lower, upper = [], [], [], [], []
@@ -282,31 +295,50 @@ def build_model(case, outages, args, exact=False, fixed=None):
         lower.append(low); upper.append(high)
 
     def flow_constraints(indices, monitored, F, b):
+        # LaTeX: \eta_{s,j}\ge0, with no finite upper bound (soft mode).
+        # LaTeX (thermal objective term): M_\eta\sum_{s,j}\eta_{s,j}.
+        # Hard mode omits eta, equivalently setting all thermal slacks to zero.
         eta = variables(np.zeros(len(monitored)), np.full(len(monitored), np.inf), args.penalty) if soft else None
         for t, j in enumerate(monitored):
             idx = list(indices) + ([int(eta[t])] if soft else [])
+            # LaTeX: f_{s,j}=F_{s,j}u_s+b_{s,j}\le\bar f_j+\eta_{s,j}.
             constraint(idx, list(F[t]) + ([-1.0] if soft else []), high=case['rates'][j] - b[t])
+            # LaTeX: -f_{s,j}\le\bar f_j+\eta_{s,j}.
+            # Together: -\bar f_j-\eta_{s,j}\le f_{s,j}\le\bar f_j+\eta_{s,j}.
             constraint(idx, list(-F[t]) + ([-1.0] if soft else []), high=case['rates'][j] + b[t])
 
+    # LaTeX: \mathbf{1}^T g = D (nominal power balance).
     constraint(g, np.ones(ng), case['D'], case['D'])
     for _, monitored, F, b in blocks:
+        # LaTeX (base): f^0=K(Bg-d).
+        # LaTeX (line outage ell): f_j^{L,ell}=f_j^0+L_{j,ell}f_ell^0,
+        # j\ne ell; only non-islanding outages and rateA>0 lines are monitored.
         flow_constraints(g, monitored, F, b)
     for s, k in enumerate(outages):
+        # LaTeX: \mathbf{1}^T g_k = D (generator-outage power balance).
         constraint(y[s], np.ones(ng), case['D'], case['D'])
+        # LaTeX: f^{G,k}=K(Bg_k-d), with soft/hard thermal bounds above.
         flow_constraints(y[s], mon, H[mon], offset[mon])
         for i in range(ng):
             if i == k:
                 continue
             # Upward-only envelope; also valid for the exact APR model.
+            # LaTeX: g_{k,i}-g_i\ge0, i\ne k.
             constraint([y[s, i], g[i]], [1.0, -1.0], low=0.0)
             if not exact:
+                # LaTeX: g_{k,i}-g_i-a_i z_k\le0,
+                # a_i=\gamma_i(\bar g_i-\underline g_i).
                 constraint([y[s, i], g[i], z[s]], [1.0, -1.0, -case['a'][i]], high=0.0)
             else:
                 # x=1: proportional; x=0: saturation. Valid for gamma in [0,1].
                 M = case['hi'][i]
+                # LaTeX: g_{k,i}-g_i-a_i z_k\le\bar g_i(1-x_{k,i}).
                 constraint([y[s, i], g[i], z[s], x[s, i]], [1.0, -1.0, -case['a'][i], M], high=M)
+                # LaTeX: g_{k,i}-g_i-a_i z_k\ge-\bar g_i(1-x_{k,i}).
                 constraint([y[s, i], g[i], z[s], x[s, i]], [1.0, -1.0, -case['a'][i], -M], low=-M)
+                # LaTeX: g_i+a_i z_k\ge\bar g_i(1-x_{k,i}).
                 constraint([g[i], z[s], x[s, i]], [1.0, case['a'][i], M], low=M)
+                # LaTeX: g_{k,i}\ge\bar g_i(1-x_{k,i}).
                 constraint([y[s, i], x[s, i]], [1.0, M], low=M)
     A = sparse.coo_matrix((data, (row, col)), shape=(len(lower), len(lb))).tocsc()
     return LinearModel(A, np.array(lower), np.array(upper), np.array(lb), np.array(ub),
@@ -315,8 +347,13 @@ def build_model(case, outages, args, exact=False, fixed=None):
 
 def solve_model(model, weight, args):
     t = perf_counter()
+    # LaTeX: min q^T v + W\sum_k z_k, where q is the incoming model objective.
+    # Signal-only budget model: q^T v=0, W=1, so min \sum_k z_k.
+    # Earlier thermal-signal budget model: min C_eta + W\sum_k z_k.
+    # Unbudgeted model: q^T v + C_0 = C_g + C_eta.
     q = model.c0.copy(); q[model.z] += weight
     scale = float(max(1.0, max0(np.abs(q))))
+    # LaTeX: argmin_v q^T v = argmin_v (q/scale)^T v for scale>0.
     qscaled = q / scale
     result = dict(status='solver_failed', solver=args.backend, weight=weight, objective_scale=scale)
     vector, bound = None, None
@@ -362,6 +399,7 @@ def solve_model(model, weight, args):
                 if eq.any(): gm.addMConstr(model.A[eq], v, '=', model.upper[eq])
                 if up.any(): gm.addMConstr(model.A[up], v, '<', model.upper[up])
                 if low.any(): gm.addMConstr(model.A[low], v, '>', model.lower[low])
+                # LaTeX: \min_v (q/scale)^T v (Gurobi defaults to minimization).
                 gm.setObjective(qscaled @ v); gm.optimize()
                 if gm.Status == gp.GRB.INF_OR_UNBD:
                     gm.Params.DualReductions = 0; gm.reset(); gm.optimize()
@@ -492,16 +530,30 @@ def penalty_threshold(case, outages):
     return records
 
 
-def budget_model(model, cap):
-    """Keep the ORIGINAL cost in a budget row; minimize thermal penalties only.
+def budget_model(model, cap, objective='signal'):
+    """Keep ORIGINAL cost in the budget; select the new objective coefficients.
 
-    solve_model subsequently adds W*sum(z). This does not fix or warm-start g.
+    signal: zero ALL coefficients, then solve_model adds sum(z), using W=1.
+    thermal-signal: retain thermal coefficients, then solve_model adds W*sum(z).
+    This does not fix or warm-start g.
     The normalized budget row is dimensionless, not a power residual in MW.
     """
     scale = max(1.0, abs(cap), abs(model.constant))
+    # LaTeX: C_g+C_eta = model.c0^T v + C_0 \le cap.
+    # Append the coefficient row BEFORE removing generation cost from the objective.
+    # The row is normalized by the same positive scale as its right-hand side.
     A = sparse.vstack([model.A, sparse.csr_matrix(model.c0.reshape(1, -1) / scale)], format='csc')
-    q = model.c0.copy()
-    q[model.g] = 0.0
+    if objective == 'signal':
+        # LaTeX (revised objective): \min \sum_k z_k.
+        # Erase BOTH generation and thermal coefficients; keep them in A above.
+        q = np.zeros_like(model.c0)
+    elif objective == 'thermal-signal':
+        # LaTeX (earlier objective before signal term): \min C_eta.
+        q = model.c0.copy()
+        q[model.g] = 0.0
+    else:
+        raise ValueError('Unknown budget objective')
+    # LaTeX: (model.c0^T v)/scale \le (cap-C_0)/scale.
     return replace(model, A=A, lower=np.r_[model.lower, -np.inf],
                    upper=np.r_[model.upper, (cap-model.constant)/scale], c0=q, constant=0.0,
                    row_is_power=np.r_[np.ones(model.A.shape[0], dtype=bool), False])
@@ -523,6 +575,8 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         refargs = copy.copy(args)
         refargs.no_line_contingencies = args.reference_opf == 'nominal'
         print(f'Solving reference {args.reference_opf} OPF (no generator outages).', flush=True)
+        # LaTeX: C_ref = min (C_g+C_eta^{reference}), with base constraints
+        # and optional line outages, but NO generator-outage/APR constraints.
         t = perf_counter(); refmodel = build_model(case, [], refargs); build = perf_counter()-t
         reference, v = solve_model(refmodel, 0.0, refargs)
         reference.update(model=f'reference_{args.reference_opf}_OPF', model_build_seconds=build)
@@ -551,12 +605,14 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
     metadata.update(reference_result=reference, reference_cost=refcost, reference_stage_seconds=reference_seconds,
                     reference_runtime_scope='External reference solve excluded' if args.reference_cost is not None else 'Reference construction, solve, validation, and reference output',
                     budget_definition='Original generation cost plus all modeled thermal penalties <= (1+epsilon)*reference_cost',
-                    budget_objective='Thermal penalties + W*sum(z); generation cost only appears in budget',
+                    budget_objective='sum(z); generation and thermal costs only appear in budget' if args.budget_objective=='signal' else 'Thermal penalties + W*sum(z); generation cost only appears in budget',
                     threshold_applies=False,
                     threshold_note='The earlier sufficient-weight argument does not cover the added cost constraint.',
                     pipeline_timing_definition='Budget candidates: input preprocessing + reference stage + own model build + own solve + own validation/recovery. Unbudgeted controls exclude the reference stage. Other sweep points and comparison solves excluded; complete experiment wall time separately recorded.')
     save_meta()
-    print('Budget objective: thermal penalties + W*sum(z); budget includes generation cost AND thermal penalties.')
+    print('Budget objective: ' + ('sum(z) ONLY' if args.budget_objective=='signal' else 'thermal penalties + W*sum(z)') + '; budget includes generation cost AND thermal penalties.')
+    if args.budget_objective == 'signal':
+        print('Signal-only objective: W=1; no penalty-weight sweep is needed. Optimal dispatch/slack values can be nonunique.')
     print('NOTE: Recovery can violate the cost budget; original APR feasibility and budget feasibility are checked separately.')
     print('NOTE: The earlier sufficient-weight argument does NOT establish APR tightness with the added budget constraint.')
     rows, all_checks, all_details, all_dispatch = [], [], [], []
@@ -571,7 +627,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         budgeted = cap is not None
         print(f'Solving {tag}, W={weight:g}' + (f', increase={100*epsilon:g}%, cap={cap:.8f}' if budgeted else ''), flush=True)
         r, vector = solve_model(model, weight, args)
-        r.update(model=tag, objective_kind='thermal_plus_signal' if budgeted else 'original_plus_signal',
+        r.update(model=tag, objective_kind=('signal_only' if args.budget_objective=='signal' else 'thermal_plus_signal') if budgeted else 'original_plus_signal',
                  shared_matrix_build_seconds=build_seconds, thermal_mode=args.thermal_mode,
                  gamma=args.gamma, demand_scale=args.demand_scale, reference_cost=refcost,
                  budget_increase=epsilon, cost_budget=cap, candidate_guarantee_applicable=False,
@@ -582,8 +638,12 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
             r.update(metrics)
             r['original_plus_signal_objective'] = metrics['penalized_objective']
             if budgeted:
-                r['penalized_objective'] = metrics['operating_objective']-metrics['generation_cost']+metrics['signal_penalty']
-                r['budget_constraint_cost_with_solver_slacks'] = float(original_lp.c0@vector+original_lp.constant) if not model.integer.any() else None
+                r['penalized_objective'] = metrics['signal_penalty']
+                if args.budget_objective == 'thermal-signal':
+                    r['penalized_objective'] += metrics['operating_objective']-metrics['generation_cost']
+                r['optimized_budget_objective'] = r['penalized_objective']
+                source = original_exact if model.integer.any() else original_lp
+                r['budget_constraint_cost_with_solver_slacks'] = float(source.c0@vector+source.constant)
                 tolerance = max(args.budget_tol, 1e-8*max(1.0, abs(cap)))
                 r['provisional_budget_violation'] = max(0.0, metrics['operating_objective']-cap)
                 r['provisional_budget_satisfied'] = r['provisional_budget_violation'] <= tolerance
@@ -616,12 +676,13 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         t = perf_counter(); original_exact = build_model(case, outages, args, True, fixed); exact_build = perf_counter()-t
         run('exact_APR', original_exact, 0.0, exact_build)
     for epsilon in dict.fromkeys(args.budget_increase):
+        # LaTeX: cap=(1+\epsilon)C_ref; epsilon=0.10 permits a 10% increase.
         cap = (1.0+epsilon)*refcost
-        t = perf_counter(); model = budget_model(original_lp, cap); build = lp_build+perf_counter()-t
+        t = perf_counter(); model = budget_model(original_lp, cap, args.budget_objective); build = lp_build+perf_counter()-t
         for weight in weights:
             run('budget_LP', model, weight, build, epsilon, cap)
         if args.compare_weighted_exact:
-            t = perf_counter(); emodel = budget_model(original_exact, cap); ebuild = exact_build+perf_counter()-t
+            t = perf_counter(); emodel = budget_model(original_exact, cap, args.budget_objective); ebuild = exact_build+perf_counter()-t
             for weight in weights:
                 run('budget_exact_APR', emodel, weight, ebuild, epsilon, cap)
     bounds = [r['solver_best_bound_penalized'] for r in rows
@@ -677,6 +738,7 @@ def parser():
     p.add_argument('--fixed-run', type=int, default=1)
     p.add_argument('--tee', action='store_true')
     p.add_argument('--budget-increase', nargs='+', type=float, help='Enable budget experiments; 0.10 means at most 10 percent above the reference cost. Accepts several fractions.')
+    p.add_argument('--budget-objective', choices=['signal','thermal-signal'], default='signal', help='signal: revised professor objective min sum(z), W fixed at 1. thermal-signal: reproduce previous thermal-plus-signal experiments.')
     p.add_argument('--reference-opf', choices=['nominal','line'], default='line', help='Reference has no generator outages; line includes nominal and selected non-islanding line contingencies (default).')
     p.add_argument('--reference-cost', type=float, help='Use an already computed positive reference cost; its external solve time and cost convention must be reported separately.')
     p.add_argument('--budget-tol', type=float, default=1e-4, help='Absolute original-cost budget validation tolerance (also allows 1e-8 relative).')
@@ -721,6 +783,8 @@ def main():
     pd.DataFrame(thresholds).to_csv(output/'penalty_thresholds.csv',index=False)
     B = max(r['B_k'] for r in thresholds)
     weights = list(dict.fromkeys([0.0]+args.weights+([1.01*B if B>0 else 1.0] if args.include_threshold else [])))
+    if args.budget_increase is not None and args.budget_objective == 'signal':
+        weights = [1.0]
     preprocess = perf_counter()-started
     metadata = dict(arguments=vars(args), case_path=str(path), python=sys.version, platform=platform.platform(),
                     numpy=np.__version__,scipy=scipy.__version__,pandas=pd.__version__,
