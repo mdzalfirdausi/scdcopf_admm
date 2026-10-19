@@ -30,6 +30,12 @@ This differs from the earlier line-only OPF and is labeled in the metadata.
 component. A zero reference penalty cannot be relaxed by a percentage.
 Optional --line-allowance/--unit-allowance add explicit absolute allowances in
 OBJECTIVE-COST units (not MW); both default to zero.
+--epsilon-g-grid, --epsilon-line-grid, --epsilon-unit-grid accept lists and
+test their Cartesian product while reusing input matrices and one reference.
+Do not supply both a scalar epsilon and its grid. Equivalent effective caps
+(for example with a zero reference penalty) share one solve, with aliases in
+metadata.json. epsilon_results.csv lists all distinct LP experiments and
+identifies candidates verified against APR AND every separate budget.
 The preventive dispatch is optimized again, not fixed to the reference OPF.
 --reference-cost VALUE reuses a previously computed cost and skips that solve;
 its external solve time is then excluded and must be reported separately.
@@ -76,6 +82,7 @@ import argparse
 from dataclasses import dataclass
 from dataclasses import replace
 import copy
+from itertools import product
 import importlib.util
 import json
 from pathlib import Path
@@ -698,21 +705,22 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         pd.DataFrame(all_details).to_csv(output/'apr_dispatch.csv', index=False)
         pd.DataFrame(all_dispatch).to_csv(output/'dispatch.csv', index=False)
 
-    def run(tag, model, weight, build_seconds, epsilon=None, cap=None):
+    def run(tag, model, weight, build_seconds, epsilon=None, cap=None, eps_setting=None, point_id=None):
         budgeted = cap is not None
         cap_text = json.dumps(cap) if isinstance(cap, dict) else (f'{cap:.8f}' if budgeted else '')
-        print(f'Solving {tag}, W={weight:g}' + (f', base increase={100*epsilon:g}%, cap={cap_text}' if budgeted else ''), flush=True)
+        print(f'Solving {tag}, W={weight:g}' + (f', point={point_id}, base increase={100*epsilon:g}%, cap={cap_text}' if budgeted else ''), flush=True)
         r, vector = solve_model(model, weight, args)
         r.update(model=tag, objective_kind=('signal_only' if args.budget_objective=='signal' else 'thermal_plus_signal') if budgeted else 'original_plus_signal',
                  shared_matrix_build_seconds=build_seconds, thermal_mode=args.thermal_mode,
                  gamma=args.gamma, demand_scale=args.demand_scale, reference_cost=refcost,
                  budget_increase=epsilon, budget_mode=args.budget_mode if budgeted else None,
+                 budget_point=point_id,
                  cost_budget=sum(cap.values()) if isinstance(cap, dict) else cap, candidate_guarantee_applicable=False,
                  external_reference_time_excluded=args.reference_cost is not None)
         if budgeted and isinstance(cap, dict):
-            r.update(epsilon_generation=args.epsilon_g if args.epsilon_g is not None else epsilon,
-                     epsilon_line=args.epsilon_line if args.epsilon_line is not None else epsilon,
-                     epsilon_unit=args.epsilon_unit if args.epsilon_unit is not None else epsilon,
+            r.update(epsilon_generation=eps_setting['generation'],
+                     epsilon_line=eps_setting['line'],
+                     epsilon_unit=eps_setting['unit'],
                      absolute_line_allowance=args.line_allowance, absolute_unit_allowance=args.unit_allowance)
         if vector is not None:
             tv = perf_counter()
@@ -741,8 +749,10 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
             for table in (checks, details, dispatch):
                 for record in table:
                     record.update(budget_increase=epsilon, budget_mode=args.budget_mode if budgeted else None,
-                                  cost_budget=sum(cap.values()) if isinstance(cap, dict) else cap)
-                    if isinstance(cap, dict): record.update({name+'_budget_cap': value for name,value in cap.items()})
+                                  budget_point=point_id, cost_budget=sum(cap.values()) if isinstance(cap, dict) else cap)
+                    if isinstance(cap, dict):
+                        record.update({name+'_budget_cap': value for name,value in cap.items()})
+                        record.update({'epsilon_'+name: value for name,value in eps_setting.items()})
             all_checks.extend(checks); all_details.extend(details); all_dispatch.extend(dispatch)
         r['pipeline_seconds'] = preprocess+(reference_seconds if budgeted else 0.0)+build_seconds+r['total_seconds']+r.get('validation_seconds', 0.0)
         r['pipeline_is_candidate_method'] = tag == 'budget_LP'
@@ -761,27 +771,48 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
     if args.compare_exact or args.compare_weighted_exact:
         t = perf_counter(); original_exact = build_model(case, outages, args, True, fixed); exact_build = perf_counter()-t
         run('exact_APR', original_exact, 0.0, exact_build)
+    settings, settings_by_caps, requested_points = [], {}, 0
     for epsilon in dict.fromkeys(args.budget_increase):
         if args.budget_mode == 'split':
-            eps = {'generation': args.epsilon_g if args.epsilon_g is not None else epsilon,
-                   'line': args.epsilon_line if args.epsilon_line is not None else epsilon,
-                   'unit': args.epsilon_unit if args.epsilon_unit is not None else epsilon}
-            # LaTeX: C_g<=(1+eps_g)C_g_ref;
-            # C_l<=(1+eps_l)C_l_ref+Delta_l; C_u<=(1+eps_u)C_u_ref+Delta_u.
-            cap = {name: (1+eps[name])*value for name,value in reference_components.items()}
-            cap['line'] += args.line_allowance; cap['unit'] += args.unit_allowance
-            metadata.setdefault('split_budget_settings', []).append(dict(base_epsilon=epsilon, epsilons=eps,
-                        absolute_line_allowance=args.line_allowance, absolute_unit_allowance=args.unit_allowance, caps=cap))
+            grids = [getattr(args, grid) or [getattr(args, scalar) if getattr(args, scalar) is not None else epsilon]
+                     for grid,scalar in [('epsilon_g_grid','epsilon_g'),('epsilon_line_grid','epsilon_line'),('epsilon_unit_grid','epsilon_unit')]]
+            epsilons = [dict(zip(['generation','line','unit'], values)) for values in product(*grids)]
         else:
-            # LaTeX: cap=(1+\epsilon)C_ref.
-            cap = (1.0+epsilon)*refcost
+            epsilons = [None]
+        for eps in epsilons:
+            requested_points += 1
+            if eps is not None:
+                # LaTeX: C_g<=(1+eps_g)C_g_ref;
+                # C_l<=(1+eps_l)C_l_ref+Delta_l; C_u<=(1+eps_u)C_u_ref+Delta_u.
+                cap = {name: (1+eps[name])*value for name,value in reference_components.items()}
+                cap['line'] += args.line_allowance; cap['unit'] += args.unit_allowance
+                key = tuple(cap.values())
+            else:
+                cap = (1.0+epsilon)*refcost
+                key = (cap,)
+            if key in settings_by_caps:
+                settings_by_caps[key]['equivalent_epsilon_settings'].append(dict(base_epsilon=epsilon, epsilons=eps))
+                continue
+            point = dict(budget_point=f'P{len(settings)+1:04d}', base_epsilon=epsilon, epsilons=eps,
+                         absolute_line_allowance=args.line_allowance, absolute_unit_allowance=args.unit_allowance,
+                         caps=cap, equivalent_epsilon_settings=[])
+            settings.append(point); settings_by_caps[key]=point
+    metadata['budget_settings'] = settings
+    metadata['requested_epsilon_combinations'] = requested_points
+    metadata['distinct_budget_combinations'] = len(settings)
+    save_meta()
+    print(f'Epsilon sweep: {requested_points} requested combinations, {len(settings)} distinct budget combinations; reference and inputs reused.')
+    if requested_points > len(settings):
+        print('Identical budgets share one solve; equivalent epsilon settings are recorded in metadata.json (e.g. zero reference penalties).')
+    for point in settings:
+        epsilon, eps, cap, point_id = point['base_epsilon'], point['epsilons'], point['caps'], point['budget_point']
         t = perf_counter(); model = budget_model(original_lp, cap, args.budget_objective); build = lp_build+perf_counter()-t
         for weight in weights:
-            run('budget_LP', model, weight, build, epsilon, cap)
+            run('budget_LP', model, weight, build, epsilon, cap, eps, point_id)
         if args.compare_weighted_exact:
             t = perf_counter(); emodel = budget_model(original_exact, cap, args.budget_objective); ebuild = exact_build+perf_counter()-t
             for weight in weights:
-                run('budget_exact_APR', emodel, weight, ebuild, epsilon, cap)
+                run('budget_exact_APR', emodel, weight, ebuild, epsilon, cap, eps, point_id)
     bounds = [r['solver_best_bound_penalized'] for r in rows
               if r['objective_kind']=='original_plus_signal' and r['weight']==0 and r['solver_best_bound_penalized'] is not None]
     if reference_bound is not None: bounds.append(reference_bound)
@@ -803,7 +834,24 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
     metadata['experiment_seconds_including_reference_and_all_sweep_and_benchmark_jobs'] = preprocess+perf_counter()-wall_start
     save_meta()
     summary = pd.DataFrame(rows)
-    columns = [c for c in ['model','budget_increase','weight','status','optimized_budget_objective','operating_objective','max_APR_L1_error_MW','recovered_operating_objective','recovered_APR_and_budget_feasible','total_seconds','pipeline_seconds'] if c in summary]
+    sweep_rows = []
+    for r in rows:
+        if r['model'] != 'budget_LP': continue
+        point = r.copy()
+        candidates = []
+        if r.get('provisional_APR_and_budget_feasible'): candidates.append(r['operating_objective'])
+        if r.get('recovered_APR_and_budget_feasible'): candidates.append(r['recovered_operating_objective'])
+        point['has_APR_and_budget_feasible_candidate'] = bool(candidates)
+        point['budget_feasible_candidate_cost'] = min(candidates) if candidates else None
+        sweep_rows.append(point)
+    sweep = pd.DataFrame(sweep_rows)
+    sweep.to_csv(output/'epsilon_results.csv', index=False)
+    feasible = sweep[sweep.has_APR_and_budget_feasible_candidate].sort_values('budget_feasible_candidate_cost')
+    print(f'APR-consistent or recovered candidates satisfying ALL budgets: {len(feasible)} of {len(sweep)} LP solves.')
+    if len(feasible):
+        print('Lowest operating costs among verified budget-feasible candidates:')
+        print(feasible[[c for c in ['budget_point','epsilon_generation','epsilon_line','epsilon_unit','optimized_budget_objective','budget_feasible_candidate_cost','max_APR_L1_error_MW'] if c in feasible]].head(5).to_string(index=False))
+    columns = [c for c in ['model','budget_point','epsilon_generation','epsilon_line','epsilon_unit','weight','status','optimized_budget_objective','operating_objective','max_APR_L1_error_MW','recovered_operating_objective','recovered_APR_and_budget_feasible','total_seconds','pipeline_seconds'] if c in summary]
     print(summary[columns].to_string(index=False)); print(f'Saved: {output.resolve()}')
     return 0 if all(r['status']=='optimal' for r in rows) else 2
 
@@ -841,6 +889,9 @@ def parser():
     p.add_argument('--epsilon-g', type=float, help='Generation-cost relative increase in split mode; otherwise use --budget-increase.')
     p.add_argument('--epsilon-line', type=float, help='Base+line-outage thermal-cost relative increase in split mode.')
     p.add_argument('--epsilon-unit', type=float, help='Generator-outage thermal-cost relative increase in split mode.')
+    p.add_argument('--epsilon-g-grid', nargs='+', type=float, help='Generation-cost epsilon values; Cartesian product with the other epsilon grids.')
+    p.add_argument('--epsilon-line-grid', nargs='+', type=float, help='Base+line thermal-cost epsilon values.')
+    p.add_argument('--epsilon-unit-grid', nargs='+', type=float, help='Generator-outage thermal-cost epsilon values; 1 means a 100 percent increase.')
     p.add_argument('--line-allowance', type=float, default=0.0, help='ADDITIVE base+line thermal-cost allowance; objective-cost units, NOT MW.')
     p.add_argument('--unit-allowance', type=float, default=0.0, help='ADDITIVE generator-outage thermal-cost allowance; objective-cost units, NOT MW.')
     p.add_argument('--reference-cost', type=float, help='Use an already computed positive reference cost; its external solve time and cost convention must be reported separately.')
@@ -867,6 +918,13 @@ def main():
         value=getattr(args,key)
         if value is not None and (not np.isfinite(value) or value < 0):
             raise ValueError(f'{key} must be a finite nonnegative number')
+    for grid,scalar in [('epsilon_g_grid','epsilon_g'),('epsilon_line_grid','epsilon_line'),('epsilon_unit_grid','epsilon_unit')]:
+        values = getattr(args,grid)
+        if values is not None:
+            if args.budget_mode != 'split': raise ValueError('Epsilon grids require --budget-mode split')
+            if getattr(args,scalar) is not None: raise ValueError(f'Use either {grid} or {scalar}, not both')
+            if any(not np.isfinite(v) or v < 0 for v in values):
+                raise ValueError(f'{grid} must contain finite nonnegative values')
     if args.budget_mode == 'split':
         if args.budget_increase is None: raise ValueError('split mode requires --budget-increase, e.g. 0.10')
         if args.reference_opf != 'envelope' or args.reference_cost is not None:
