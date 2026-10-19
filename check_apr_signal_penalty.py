@@ -47,6 +47,13 @@ This slack objective is not the original APR mismatch. In fact,
  min(splus,sminus)=min(Pmax,g+a*z)-y for feasible envelope outputs,
  splus+sminus=abs(Pmax-g-a*z)+2*min(splus,sminus).
 Thus even a physical APR solution can have a positive slack objective.
+
+DIAGNOSTIC: --budget-objective operating minimizes the ORIGINAL generation
+plus thermal cost under the selected budgets. Add --compare-weighted-exact
+to solve an exact-APR MILP with the same budgets and operating objective.
+Compare exact_APR (unrestricted original optimum) with budget_exact_APR
+(best original cost under the budgets). This quantifies the cost restriction
+from the budgets, rather than confusing it with an APR-slack objective value.
 The preventive dispatch is optimized again, not fixed to the reference OPF.
 --reference-cost VALUE reuses a previously computed cost and skips that solve;
 its external solve time is then excluded and must be reported separately.
@@ -716,10 +723,13 @@ def budget_model(model, cap, objective='signal'):
         q = np.zeros_like(model.c0)
         q[model.splus] = 1.0
         q[model.sminus] = 1.0
+    elif objective == 'operating':
+        # LaTeX (diagnostic): min C_g+C_l+C_u under the selected cost caps.
+        q = model.c0.copy()
     else:
         raise ValueError('Unknown budget objective')
     return replace(model, A=A, lower=np.r_[model.lower, np.full(len(specifications), -np.inf)],
-                   upper=np.r_[model.upper, budget_upper], c0=q, constant=0.0,
+                   upper=np.r_[model.upper, budget_upper], c0=q, constant=model.constant if objective=='operating' else 0.0,
                    original_cost=model.c0.copy(),original_constant=model.constant,
                    row_is_power=np.r_[np.ones(model.A.shape[0], dtype=bool), np.zeros(len(specifications), dtype=bool)])
 
@@ -784,18 +794,23 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                     budget_definition='Separate C_g, C_l (base+line outages), C_u (generator-outage line overloads) caps' if args.budget_mode=='split' else 'Original generation cost plus all modeled thermal penalties <= (1+epsilon)*reference_cost',
                     budget_objective={'signal':'sum(z); generation and thermal costs only appear in budget',
                                       'thermal-signal':'Thermal penalties + W*sum(z)',
-                                      'apr-slack':'sum(splus+sminus) in per unit; no direct signal or thermal objective'}[args.budget_objective],
+                                      'apr-slack':'sum(splus+sminus) in per unit; no direct signal or thermal objective',
+                                      'operating':'Original C_g+C_l+C_u under selected budgets (diagnostic)'}[args.budget_objective],
                     threshold_applies=False,
                     threshold_note='The earlier sufficient-weight argument does not cover the added cost constraint.',
                     pipeline_timing_definition='Budget candidates: input preprocessing + reference stage + own model build + own solve + own validation/recovery. Unbudgeted controls exclude the reference stage. Other sweep points and comparison solves excluded; complete experiment wall time separately recorded.')
     save_meta()
     print('Budget objective: ' + {'signal':'sum(z) ONLY','thermal-signal':'thermal penalties + W*sum(z)',
-                                 'apr-slack':'sum(splus+sminus) ONLY (per unit)'}[args.budget_objective] + f'; budget mode={args.budget_mode}.')
+                                 'apr-slack':'sum(splus+sminus) ONLY (per unit)',
+                                 'operating':'ORIGINAL operating cost C_g+C_l+C_u (diagnostic)'}[args.budget_objective] + f'; budget mode={args.budget_mode}.')
     if args.budget_objective == 'signal':
         print('Signal-only objective: W=1; no penalty-weight sweep is needed. Optimal dispatch/slack values can be nonunique.')
     elif args.budget_objective == 'apr-slack':
         print('APR-slack objective: W=0, no direct signal penalty. All three handwritten equalities and nonnegative APR slacks are included.')
         print('NOTE: sum(splus+sminus) is NOT APR mismatch and need not be zero for an APR-consistent solution.')
+    elif args.budget_objective == 'operating':
+        print('Operating-cost diagnostic: W=0. Only budget_exact_APR certifies the best original SCOPF cost under these budgets; budget_LP is a relaxation.')
+        if not args.compare_weighted_exact: print('Use --compare-weighted-exact to quantify the restriction from the budgets with an exact-APR benchmark.')
     print('NOTE: Recovery can violate the cost budget; original APR feasibility and budget feasibility are checked separately.')
     print('NOTE: The earlier sufficient-weight argument does NOT establish APR tightness with the added budget constraint.')
     rows, all_checks, all_details, all_dispatch = [], [], [], []
@@ -811,7 +826,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         cap_text = json.dumps(cap) if isinstance(cap, dict) else (f'{cap:.8f}' if budgeted else '')
         print(f'Solving {tag}, W={weight:g}' + (f', point={point_id}, base increase={100*epsilon:g}%, cap={cap_text}' if budgeted else ''), flush=True)
         r, vector = solve_model(model, weight, args)
-        r.update(model=tag, objective_kind={'signal':'signal_only','thermal-signal':'thermal_plus_signal','apr-slack':'apr_slack_sum'}[args.budget_objective] if budgeted else 'original_plus_signal',
+        r.update(model=tag, objective_kind={'signal':'signal_only','thermal-signal':'thermal_plus_signal','apr-slack':'apr_slack_sum','operating':'original_cost_under_budgets'}[args.budget_objective] if budgeted else 'original_plus_signal',
                  shared_matrix_build_seconds=build_seconds, thermal_mode=args.thermal_mode,
                  gamma=args.gamma, demand_scale=args.demand_scale, reference_cost=refcost,
                  budget_increase=epsilon, budget_mode=args.budget_mode if budgeted else None,
@@ -832,8 +847,10 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                 r['penalized_objective'] = metrics['apr_slack_sum_pu'] if args.budget_objective=='apr-slack' else metrics['signal_penalty']
                 if args.budget_objective == 'thermal-signal':
                     r['penalized_objective'] += metrics['operating_objective']-metrics['generation_cost']
+                elif args.budget_objective == 'operating':
+                    r['penalized_objective'] = metrics['operating_objective']
                 r['optimized_budget_objective'] = r['penalized_objective']
-                r['optimized_budget_objective_units'] = {'signal':'dimensionless','thermal-signal':'original_objective_cost_units','apr-slack':'per_unit_power_sum'}[args.budget_objective]
+                r['optimized_budget_objective_units'] = {'signal':'dimensionless','thermal-signal':'original_objective_cost_units','apr-slack':'per_unit_power_sum','operating':'original_objective_cost_units'}[args.budget_objective]
                 r['budget_constraint_cost_with_solver_slacks'] = float(model.original_cost@vector+model.original_constant)
                 diagnostics = budget_diagnostics(metrics, cap, args)
                 r.update({'provisional_'+key: value for key,value in diagnostics.items()})
@@ -938,6 +955,27 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
             r['recovered_difference_vs_original_exact'] = r['recovered_operating_objective']-benchmark['operating_objective']
             r['recovered_relative_difference_vs_original_exact'] = r['recovered_difference_vs_original_exact']/max(1.0, abs(benchmark['operating_objective']))
     save_progress()
+    if args.budget_objective == 'operating' and args.compare_weighted_exact:
+        diagnostic = []
+        for r in rows:
+            if r['model'] != 'budget_exact_APR': continue
+            d = {key:r.get(key) for key in ['budget_point','epsilon_generation','epsilon_line','epsilon_unit','status','operating_objective','solver_best_bound_penalized']}
+            if benchmark:
+                d['unrestricted_MILP_optimum'] = benchmark['operating_objective']
+                if r['status']=='optimal' and r.get('provisional_APR_and_budget_feasible'):
+                    gap = r['operating_objective']-benchmark['operating_objective']
+                    tolerance = max(1e-4,1e-7*abs(benchmark['operating_objective']))
+                    d['cost_increase_due_to_budgets'] = gap
+                    d['relative_cost_increase_due_to_budgets'] = gap/max(1.,abs(benchmark['operating_objective']))
+                    d['conclusion'] = 'Original optimum attainable within solver tolerance' if abs(gap)<=tolerance else 'Budgets raise the minimum original operating cost' if gap>0 else 'Inspect solver tolerances and validation'
+                elif r['status']=='infeasible':
+                    d['conclusion'] = 'Budgets exclude every exact-APR feasible solution'
+                else: d['conclusion'] = 'No certified budget-restricted optimum; inspect status and bounds'
+            else: d['conclusion'] = 'Unrestricted MILP optimum unavailable; no certified cost-gap comparison'
+            diagnostic.append(d)
+        pd.DataFrame(diagnostic).to_csv(output/'budget_cost_diagnostics.csv',index=False)
+        print('Budget restriction diagnostic (ORIGINAL operating objective):')
+        print(pd.DataFrame(diagnostic).to_string(index=False))
     metadata['experiment_seconds_including_reference_and_all_sweep_and_benchmark_jobs'] = preprocess+perf_counter()-wall_start
     save_meta()
     summary = pd.DataFrame(rows)
@@ -990,7 +1028,7 @@ def parser():
     p.add_argument('--fixed-run', type=int, default=1)
     p.add_argument('--tee', action='store_true')
     p.add_argument('--budget-increase', nargs='+', type=float, help='Enable budget experiments; 0.10 means at most 10 percent above the reference cost. Accepts several fractions.')
-    p.add_argument('--budget-objective', choices=['signal','thermal-signal','apr-slack'], default='signal', help='signal: min sum(z), W=1. apr-slack: handwritten nonnegative APR-slack equations, min sum(splus+sminus), W=0. thermal-signal: earlier weighted objective.')
+    p.add_argument('--budget-objective', choices=['signal','thermal-signal','apr-slack','operating'], default='signal', help='signal: min sum(z). apr-slack: min sum(splus+sminus). operating: diagnostic min original cost under budgets. thermal-signal: earlier weighted objective.')
     p.add_argument('--reference-opf', choices=['nominal','line','envelope'], default='line', help='nominal/line omit generator outages; envelope includes full continuous generator-APR relaxation and is required for split budgets.')
     p.add_argument('--budget-mode', choices=['joint','split'], default='joint', help='joint: combined cost cap; split: separate generation, base+line thermal, and generator-outage thermal caps.')
     p.add_argument('--epsilon-g', type=float, help='Generation-cost relative increase in split mode; otherwise use --budget-increase.')
@@ -1021,8 +1059,8 @@ def main():
         raise ValueError('reference-cost must be positive and finite')
     if args.reference_cost is not None and args.budget_increase is None:
         raise ValueError('reference-cost requires --budget-increase')
-    if args.budget_objective == 'apr-slack' and args.budget_increase is None:
-        raise ValueError('apr-slack objective requires a budget experiment, e.g. --budget-increase 0.10')
+    if args.budget_objective in ('apr-slack','operating') and args.budget_increase is None:
+        raise ValueError('Selected objective requires a budget experiment, e.g. --budget-increase 0.10')
     for key in ('epsilon_g','epsilon_line','epsilon_unit','line_allowance','unit_allowance'):
         value=getattr(args,key)
         if value is not None and (not np.isfinite(value) or value < 0):
@@ -1065,7 +1103,7 @@ def main():
     weights = list(dict.fromkeys([0.0]+args.weights+([1.01*B if B>0 else 1.0] if args.include_threshold else [])))
     if args.budget_increase is not None and args.budget_objective == 'signal':
         weights = [1.0]
-    elif args.budget_increase is not None and args.budget_objective == 'apr-slack':
+    elif args.budget_increase is not None and args.budget_objective in ('apr-slack','operating'):
         weights = [0.0]
     preprocess = perf_counter()-started
     metadata = dict(arguments=vars(args), case_path=str(path), python=sys.version, platform=platform.platform(),
