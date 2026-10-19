@@ -10,6 +10,19 @@ Slacks default to SOFT, nonnegative, with no upper bounds.
 --compare-exact adds the original APR MILP (W=0).
 --compare-weighted-exact also solves exact-APR MILPs with each requested W.
 
+NEW: --budget-increase 0.10 enables the professor's cost-budget experiment.
+First solve a reference OPF without generator outages (--reference-opf line,
+the default, or nominal). Then enforce ORIGINAL generation cost + ALL thermal
+penalties <= 1.10 * reference cost, and minimize thermal penalties + W*sum(z).
+The preventive dispatch is optimized again, not fixed to the reference OPF.
+--reference-cost VALUE reuses a previously computed cost and skips that solve;
+its external solve time is then excluded and must be reported separately.
+Recovery is checked for APR feasibility AND cost-budget feasibility separately.
+The previous sufficient-W argument does not apply with a cost-budget constraint.
+pipeline_seconds charges input preprocessing, reference stage, model building,
+solve, and validation/recovery to each candidate; it excludes other sweep points
+and optional MILP benchmarks. This is not a guaranteed exact MILP replacement.
+
 Linear c1 costs, c0 constant; c2 is deliberately ignored, as in original P1.
 Power variables are per unit. Penalty is per unit slack, NOT per MW.
 W is in original objective units per normalized signal; it is NOT per MW.
@@ -27,6 +40,12 @@ Small modified test (original case5 demand 1000 MW is generator-N-1 infeasible):
    --gamma 1 --demand-scale 0.9 --no-line-contingencies --solver highs \
    --weights 0 1 10 100 1000 --include-threshold --compare-exact
 
+Cost-budget example, including non-islanding line contingencies:
+ python check_apr_signal_penalty.py --case pglib_opf_case5_pjm.xlsx \
+   --gamma 1 --demand-scale 0.9 --solver highs --thermal-mode soft \
+   --budget-increase 0.10 --reference-opf line --weights 1 100 1000 \
+   --compare-exact --output-dir output_apr_budget_case5
+
 Input Excel schema: baseMVA, bus, gen, gencost, branch, matching the P1 script.
 A case stem without .xlsx is accepted. Default folder: ../excel_outputs.
 --fixed-dispatch CSV accepts gen_ID,generation_MW and, if present, --fixed-method
@@ -39,6 +58,8 @@ A numerical sweep illustrates a result; it does not prove a theorem or novelty.
 """
 import argparse
 from dataclasses import dataclass
+from dataclasses import replace
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -202,6 +223,7 @@ class LinearModel:
     z: np.ndarray
     x: dict
     constant: float
+    row_is_power: object = None
 
 
 def network_blocks(case, include_lines):
@@ -364,15 +386,19 @@ def solve_model(model, weight, args):
         dimensionless[model.z] = True
         if model.x: dimensionless[list(model.x.values())] = True
         power = ~dimensionless
-        violation = max(max0(model.lower - model.A @ vector), max0(model.A @ vector - model.upper),
+        row_power = np.ones(model.A.shape[0], dtype=bool) if model.row_is_power is None else model.row_is_power
+        row_error = np.maximum(model.lower - model.A @ vector, model.A @ vector - model.upper)
+        violation = max(max0(row_error[row_power]),
                         max0(model.lb[power] - vector[power]), max0(vector[power] - model.ub[power]))
+        other_error = max0(row_error[~row_power])
         domain_error = max(max0(model.lb[dimensionless] - vector[dimensionless]),
                            max0(vector[dimensionless] - model.ub[dimensionless]))
         int_error = max0(np.abs(vector[model.integer > 0] - np.rint(vector[model.integer > 0])))
         result['power_constraint_violation_MW'] = violation * args.base
         result['signal_and_binary_domain_error'] = domain_error
         result['integrality_error'] = int_error
-        result['solver_point_verified'] = bool(violation * args.base <= args.feas_tol_mw and domain_error <= 1e-7 and int_error <= 1e-6)
+        result['normalized_nonpower_constraint_error'] = other_error
+        result['solver_point_verified'] = bool(violation * args.base <= args.feas_tol_mw and domain_error <= 1e-7 and int_error <= 1e-6 and other_error <= 1e-8)
     return result, vector
 
 
@@ -466,6 +492,164 @@ def penalty_threshold(case, outages):
     return records
 
 
+def budget_model(model, cap):
+    """Keep the ORIGINAL cost in a budget row; minimize thermal penalties only.
+
+    solve_model subsequently adds W*sum(z). This does not fix or warm-start g.
+    The normalized budget row is dimensionless, not a power residual in MW.
+    """
+    scale = max(1.0, abs(cap), abs(model.constant))
+    A = sparse.vstack([model.A, sparse.csr_matrix(model.c0.reshape(1, -1) / scale)], format='csc')
+    q = model.c0.copy()
+    q[model.g] = 0.0
+    return replace(model, A=A, lower=np.r_[model.lower, -np.inf],
+                   upper=np.r_[model.upper, (cap-model.constant)/scale], c0=q, constant=0.0,
+                   row_is_power=np.r_[np.ones(model.A.shape[0], dtype=bool), False])
+
+
+def run_budget_experiment(case, outages, args, fixed, output, metadata, preprocess, weights):
+    """Reference OPF -> cost-budget LP -> physical recovery; optional MILP controls."""
+    wall_start = perf_counter()
+    save_meta = lambda: (output/'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+    reference_start = perf_counter()
+    reference_bound = None
+    if args.reference_cost is not None:
+        reference = dict(model='supplied_reference', status='supplied_not_independently_verified',
+                         operating_objective=args.reference_cost, total_seconds=0.0,
+                         note='External reference solve time is not included; report it separately.')
+        refcost = args.reference_cost
+        print(f'Using supplied reference cost {refcost:.8f}; external reference runtime is excluded.')
+    else:
+        refargs = copy.copy(args)
+        refargs.no_line_contingencies = args.reference_opf == 'nominal'
+        print(f'Solving reference {args.reference_opf} OPF (no generator outages).', flush=True)
+        t = perf_counter(); refmodel = build_model(case, [], refargs); build = perf_counter()-t
+        reference, v = solve_model(refmodel, 0.0, refargs)
+        reference.update(model=f'reference_{args.reference_opf}_OPF', model_build_seconds=build)
+        if v is not None:
+            tv = perf_counter()
+            metrics = operating_metrics(case, [], v[refmodel.g], [], not refargs.no_line_contingencies, args.penalty)
+            reference.update(metrics); reference['validation_seconds'] = perf_counter()-tv
+            pd.DataFrame(dict(gen_ID=case['gen'].gen_ID, bus_i=case['gen'].bus_i,
+                              generation_MW=v[refmodel.g]*case['base'])).to_csv(output/'reference_dispatch.csv', index=False)
+        pd.DataFrame([reference]).to_csv(output/'reference_summary.csv', index=False)
+        if reference['status'] != 'optimal' or not reference.get('solver_point_verified'):
+            print('Reference OPF did not produce a verified optimum; no automatic cost budget was formed.')
+            pd.DataFrame([reference]).to_csv(output/'summary.csv', index=False)
+            metadata['reference_result'] = reference; save_meta()
+            return 2
+        refcost = reference['operating_objective']
+        # A reference with additional line constraints is not a lower bound for
+        # a target that explicitly omitted those constraints.
+        if refargs.no_line_contingencies or not args.no_line_contingencies:
+            reference_bound = reference['solver_best_bound_penalized']
+        print(f'  Reference cost={refcost:.8f}; solve={reference["total_seconds"]:.4f}s')
+    pd.DataFrame([reference]).to_csv(output/'reference_summary.csv', index=False)
+    if not np.isfinite(refcost) or refcost <= 0:
+        raise ValueError('Percentage budgets require a positive finite reference cost; inspect cost conventions.')
+    reference_seconds = perf_counter()-reference_start
+    metadata.update(reference_result=reference, reference_cost=refcost, reference_stage_seconds=reference_seconds,
+                    reference_runtime_scope='External reference solve excluded' if args.reference_cost is not None else 'Reference construction, solve, validation, and reference output',
+                    budget_definition='Original generation cost plus all modeled thermal penalties <= (1+epsilon)*reference_cost',
+                    budget_objective='Thermal penalties + W*sum(z); generation cost only appears in budget',
+                    threshold_applies=False,
+                    threshold_note='The earlier sufficient-weight argument does not cover the added cost constraint.',
+                    pipeline_timing_definition='Budget candidates: input preprocessing + reference stage + own model build + own solve + own validation/recovery. Unbudgeted controls exclude the reference stage. Other sweep points and comparison solves excluded; complete experiment wall time separately recorded.')
+    save_meta()
+    print('Budget objective: thermal penalties + W*sum(z); budget includes generation cost AND thermal penalties.')
+    print('NOTE: Recovery can violate the cost budget; original APR feasibility and budget feasibility are checked separately.')
+    print('NOTE: The earlier sufficient-weight argument does NOT establish APR tightness with the added budget constraint.')
+    rows, all_checks, all_details, all_dispatch = [], [], [], []
+
+    def save_progress():
+        pd.DataFrame(rows).to_csv(output/'summary.csv', index=False)
+        pd.DataFrame(all_checks).to_csv(output/'apr_checks.csv', index=False)
+        pd.DataFrame(all_details).to_csv(output/'apr_dispatch.csv', index=False)
+        pd.DataFrame(all_dispatch).to_csv(output/'dispatch.csv', index=False)
+
+    def run(tag, model, weight, build_seconds, epsilon=None, cap=None):
+        budgeted = cap is not None
+        print(f'Solving {tag}, W={weight:g}' + (f', increase={100*epsilon:g}%, cap={cap:.8f}' if budgeted else ''), flush=True)
+        r, vector = solve_model(model, weight, args)
+        r.update(model=tag, objective_kind='thermal_plus_signal' if budgeted else 'original_plus_signal',
+                 shared_matrix_build_seconds=build_seconds, thermal_mode=args.thermal_mode,
+                 gamma=args.gamma, demand_scale=args.demand_scale, reference_cost=refcost,
+                 budget_increase=epsilon, cost_budget=cap, candidate_guarantee_applicable=False,
+                 external_reference_time_excluded=args.reference_cost is not None)
+        if vector is not None:
+            tv = perf_counter()
+            metrics, checks, details, dispatch = analyze(case, outages, model, vector, args, tag, weight)
+            r.update(metrics)
+            r['original_plus_signal_objective'] = metrics['penalized_objective']
+            if budgeted:
+                r['penalized_objective'] = metrics['operating_objective']-metrics['generation_cost']+metrics['signal_penalty']
+                r['budget_constraint_cost_with_solver_slacks'] = float(original_lp.c0@vector+original_lp.constant) if not model.integer.any() else None
+                tolerance = max(args.budget_tol, 1e-8*max(1.0, abs(cap)))
+                r['provisional_budget_violation'] = max(0.0, metrics['operating_objective']-cap)
+                r['provisional_budget_satisfied'] = r['provisional_budget_violation'] <= tolerance
+                r['provisional_APR_and_budget_feasible'] = bool(metrics['provisional_original_APR_feasible'] and r['provisional_budget_satisfied'] and r['solver_point_verified'])
+                if metrics.get('recovery_success'):
+                    rc = metrics['recovered_operating_objective']
+                    r['recovered_budget_violation'] = max(0.0, rc-cap)
+                    r['recovered_budget_satisfied'] = r['recovered_budget_violation'] <= tolerance
+                    r['recovered_APR_and_budget_feasible'] = bool(metrics.get('recovered_original_APR_feasible') and r['recovered_budget_satisfied'])
+            r['provisional_original_APR_feasible'] &= r['solver_point_verified']
+            if not r['solver_point_verified']: r['status'] = 'validation_failed'
+            r['validation_seconds'] = perf_counter()-tv
+            for table in (checks, details, dispatch):
+                for record in table:
+                    record.update(budget_increase=epsilon, cost_budget=cap)
+            all_checks.extend(checks); all_details.extend(details); all_dispatch.extend(dispatch)
+        r['pipeline_seconds'] = preprocess+(reference_seconds if budgeted else 0.0)+build_seconds+r['total_seconds']+r.get('validation_seconds', 0.0)
+        r['pipeline_is_candidate_method'] = tag == 'budget_LP'
+        rows.append(r); save_progress()
+        print(f'  status={r["status"]}; solve={r["total_seconds"]:.4f}s; pipeline={r["pipeline_seconds"]:.4f}s; original cost={r.get("operating_objective", float("nan")):.8f}; APR error={r.get("max_APR_L1_error_MW", float("nan")):.6g} MW', flush=True)
+        if budgeted and r.get('recovery_success'):
+            print(f'  Recovered cost={r["recovered_operating_objective"]:.8f}; recovered APR+budget feasible={r["recovered_APR_and_budget_feasible"]}', flush=True)
+        return r
+
+    # Unbudgeted W=0 LP gives a valid lower bound for the original operating objective.
+    t = perf_counter(); original_lp = build_model(case, outages, args, False, fixed); lp_build = perf_counter()-t
+    run('envelope_LP', original_lp, 0.0, lp_build)
+    original_exact = None
+    if args.compare_exact or args.compare_weighted_exact:
+        t = perf_counter(); original_exact = build_model(case, outages, args, True, fixed); exact_build = perf_counter()-t
+        run('exact_APR', original_exact, 0.0, exact_build)
+    for epsilon in dict.fromkeys(args.budget_increase):
+        cap = (1.0+epsilon)*refcost
+        t = perf_counter(); model = budget_model(original_lp, cap); build = lp_build+perf_counter()-t
+        for weight in weights:
+            run('budget_LP', model, weight, build, epsilon, cap)
+        if args.compare_weighted_exact:
+            t = perf_counter(); emodel = budget_model(original_exact, cap); ebuild = exact_build+perf_counter()-t
+            for weight in weights:
+                run('budget_exact_APR', emodel, weight, ebuild, epsilon, cap)
+    bounds = [r['solver_best_bound_penalized'] for r in rows
+              if r['objective_kind']=='original_plus_signal' and r['weight']==0 and r['solver_best_bound_penalized'] is not None]
+    if reference_bound is not None: bounds.append(reference_bound)
+    lower = max(bounds) if bounds else None
+    benchmark = next((r for r in rows if r['model']=='exact_APR' and r['status']=='optimal' and r.get('provisional_original_APR_feasible')), None)
+    for r in rows:
+        r['bound_scope'] = 'fixed_dispatch_problem' if fixed is not None else 'full_preventive_problem'
+        r['valid_lower_bound_original' if fixed is None else 'valid_lower_bound_fixed_dispatch'] = lower
+        incumbent = r.get('recovered_operating_objective') if r.get('recovered_original_APR_feasible') else None
+        if r.get('provisional_original_APR_feasible'):
+            incumbent = min(incumbent, r['operating_objective']) if incumbent is not None else r['operating_objective']
+        r['verified_original_upper_bound'] = incumbent
+        if incumbent is not None and lower is not None:
+            r['certified_original_gap' if fixed is None else 'certified_fixed_dispatch_gap'] = incumbent-lower
+        if benchmark and r.get('recovery_success'):
+            r['recovered_difference_vs_original_exact'] = r['recovered_operating_objective']-benchmark['operating_objective']
+            r['recovered_relative_difference_vs_original_exact'] = r['recovered_difference_vs_original_exact']/max(1.0, abs(benchmark['operating_objective']))
+    save_progress()
+    metadata['experiment_seconds_including_reference_and_all_sweep_and_benchmark_jobs'] = preprocess+perf_counter()-wall_start
+    save_meta()
+    summary = pd.DataFrame(rows)
+    columns = [c for c in ['model','budget_increase','weight','status','operating_objective','max_APR_L1_error_MW','recovered_operating_objective','recovered_APR_and_budget_feasible','total_seconds','pipeline_seconds'] if c in summary]
+    print(summary[columns].to_string(index=False)); print(f'Saved: {output.resolve()}')
+    return 0 if all(r['status']=='optimal' for r in rows) else 2
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--case', required=True)
@@ -492,6 +676,10 @@ def parser():
     p.add_argument('--fixed-method', default='central')
     p.add_argument('--fixed-run', type=int, default=1)
     p.add_argument('--tee', action='store_true')
+    p.add_argument('--budget-increase', nargs='+', type=float, help='Enable budget experiments; 0.10 means at most 10 percent above the reference cost. Accepts several fractions.')
+    p.add_argument('--reference-opf', choices=['nominal','line'], default='line', help='Reference has no generator outages; line includes nominal and selected non-islanding line contingencies (default).')
+    p.add_argument('--reference-cost', type=float, help='Use an already computed positive reference cost; its external solve time and cost convention must be reported separately.')
+    p.add_argument('--budget-tol', type=float, default=1e-4, help='Absolute original-cost budget validation tolerance (also allows 1e-8 relative).')
     return p
 
 
@@ -504,6 +692,13 @@ def main():
     if args.threads < 1 or args.fixed_run < 1 or not np.isfinite(args.mip_gap) or args.mip_gap < 0:
         raise ValueError('Invalid threads, fixed-run, or MIP gap')
     if any(not np.isfinite(w) or w < 0 for w in args.weights): raise ValueError('Weights must be finite and nonnegative')
+    if args.budget_increase is not None and any(not np.isfinite(e) or e < 0 for e in args.budget_increase):
+        raise ValueError('Budget increases must be finite nonnegative fractions; 0.10 means 10 percent.')
+    if args.reference_cost is not None and (not np.isfinite(args.reference_cost) or args.reference_cost <= 0):
+        raise ValueError('reference-cost must be positive and finite')
+    if args.reference_cost is not None and args.budget_increase is None:
+        raise ValueError('reference-cost requires --budget-increase')
+    if not np.isfinite(args.budget_tol) or args.budget_tol <= 0: raise ValueError('budget-tol must be positive and finite')
     args.backend = args.solver if args.solver != 'auto' else ('gurobi' if importlib.util.find_spec('gurobipy') else 'highs')
     started = perf_counter(); path = resolve_case(args.case, args.case_dir)
     case = load_case(path, args.demand_scale); case['a'] = args.gamma * (case['hi'] - case['lo'])
@@ -513,7 +708,8 @@ def main():
     excluded = case['branch'].iloc[case['excluded']].copy()
     excluded['reason'] = 'islanding outage: excluded from LODF formulation'
     excluded.to_csv(output/'excluded_outages.csv', index=False)
-    if len(excluded) and not args.no_line_contingencies and args.islanding == 'error':
+    reference_uses_lines = args.budget_increase is not None and args.reference_cost is None and args.reference_opf == 'line'
+    if len(excluded) and (not args.no_line_contingencies or reference_uses_lines) and args.islanding == 'error':
         raise ValueError('Islanding outages found. Use --islanding skip explicitly to study only the non-islanding subset.')
     fixed = read_fixed_dispatch(case,args)
     screen = [dict(gen_ID=case['gen'].iloc[k].gen_ID, surviving_capacity_MW=float(case['hi'].sum()-case['hi'][k])*case['base'],
@@ -532,7 +728,7 @@ def main():
                     generator_contingencies=[id_key(case['gen'].iloc[k].gen_ID) for k in outages],
                     line_contingencies=0 if args.no_line_contingencies else len(case['eligible']),
                     excluded_islanding=len(excluded) if not args.no_line_contingencies else 0,
-                    candidate_penalty_threshold=B, threshold_applies=args.thermal_mode=='soft',
+                    candidate_penalty_threshold=B, threshold_applies=args.thermal_mode=='soft' and args.budget_increase is None,
                     fixed_preventive_dispatch=fixed is not None, weights=weights,
                     cost_convention='c1 in money/MW, powers per unit, penalty per unit thermal slack; c2 ignored',
                     interpretation='Centralized model test, not ADMM; original cost excludes W sum(z); numerical tightness is not a proof')
@@ -543,12 +739,14 @@ def main():
     print(f'Case={path.name}; demand={case["D"]*case["base"]:g} MW; gamma={args.gamma:g}; solver={args.backend}')
     print(f'Generator outages={len(outages)}; line outages={metadata["line_contingencies"]}; excluded islanding={metadata["excluded_islanding"]}; mode={args.thermal_mode}')
     print(f'Candidate soft-limit threshold B={B:.8g}; tested W={weights}')
-    print('NOTE: Only the SOFT formulation with unbounded slacks is covered by the proposed sufficient-weight argument.')
+    print('NOTE: The proposed sufficient-weight argument concerns only SOFT limits with unbounded slacks and NO cost budget.')
     if np.any(case['gen'].c2.to_numpy(float)!=0): print('NOTE: c2 ignored; using linear c1 generation costs.')
     if any(r['capacity_shortage_MW']>args.feas_tol_mw for r in screen):
         print('INFEASIBLE: at least one outage leaves insufficient total surviving capacity. See capacity_screen.csv; thermal slacks cannot replace generation.')
         pd.DataFrame([dict(model='capacity_screen',status='infeasible_capacity')]).to_csv(output/'summary.csv',index=False)
         return 2
+    if args.budget_increase is not None:
+        return run_budget_experiment(case,outages,args,fixed,output,metadata,preprocess,weights)
     t=perf_counter(); lp=build_model(case,outages,args,False,fixed); lp_build=perf_counter()-t
     exact=None; exact_build=None
     if args.compare_exact or args.compare_weighted_exact:
