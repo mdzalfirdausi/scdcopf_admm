@@ -48,6 +48,13 @@ This slack objective is not the original APR mismatch. In fact,
  splus+sminus=abs(Pmax-g-a*z)+2*min(splus,sminus).
 Thus even a physical APR solution can have a positive slack objective.
 
+TWO-STAGE: --budget-objective apr-slack --lexicographic-cost first minimizes
+APR slacks, then minimizes original operating cost subject to the optimal
+slack sum plus --slack-preserve-tol (default 1e-7 per unit). Individual slacks
+and dispatches remain free. Stage two can lose APR consistency; both stages
+are independently validated. Results: budget_LP and budget_LP_cost;
+lexicographic_comparison.csv compares cost, slack sum, APR error and timing.
+
 DIAGNOSTIC: --budget-objective operating minimizes the ORIGINAL generation
 plus thermal cost under the selected budgets. Add --compare-weighted-exact
 to solve an exact-APR MILP with the same budgets and operating objective.
@@ -734,6 +741,26 @@ def budget_model(model, cap, objective='signal'):
                    row_is_power=np.r_[np.ones(model.A.shape[0], dtype=bool), np.zeros(len(specifications), dtype=bool)])
 
 
+def preserve_slack_optimum(model, optimum, tolerance):
+    """Stage two: minimize original cost with sum(splus+sminus)<=Sstar+tau.
+
+    Keep every budget, bound, and physical row unchanged. The new row is
+    normalized and independently checked as a nonpower constraint.
+    """
+    if model.splus is None or model.original_cost is None:
+        raise ValueError('Stage two requires an APR-slack budget model')
+    coefficients = np.zeros_like(model.c0)
+    coefficients[model.splus] = 1.0
+    coefficients[model.sminus] = 1.0
+    limit = optimum+tolerance
+    scale = max(1.0, abs(limit))
+    row = sparse.csr_matrix(coefficients.reshape(1, -1)/scale)
+    return replace(model, A=sparse.vstack([model.A, row], format='csc'),
+                   lower=np.r_[model.lower, -np.inf], upper=np.r_[model.upper, limit/scale],
+                   row_is_power=np.r_[model.row_is_power, False],
+                   c0=model.original_cost.copy(), constant=model.original_constant)
+
+
 def run_budget_experiment(case, outages, args, fixed, output, metadata, preprocess, weights):
     """Reference OPF -> cost-budget LP -> physical recovery; optional MILP controls."""
     wall_start = perf_counter()
@@ -788,7 +815,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         if reference_components['line'] <= args.budget_tol or reference_components['unit'] <= args.budget_tol:
             print('NOTE: A zero reference penalty stays zero for ANY relative epsilon. Optional absolute allowances are in objective-cost units.')
     reference_seconds = perf_counter()-reference_start
-    metadata.update(reference_result=reference, reference_cost=refcost, reference_stage_seconds=reference_seconds,
+    metadata.update(lexicographic_cost=args.lexicographic_cost, slack_preserve_tolerance_pu=args.slack_preserve_tol, reference_result=reference, reference_cost=refcost, reference_stage_seconds=reference_seconds,
                     reference_runtime_scope='External reference solve excluded' if args.reference_cost is not None else 'Reference construction, solve, validation, and reference output',
                     budget_mode=args.budget_mode, reference_components=reference_components,
                     budget_definition='Separate C_g, C_l (base+line outages), C_u (generator-outage line overloads) caps' if args.budget_mode=='split' else 'Original generation cost plus all modeled thermal penalties <= (1+epsilon)*reference_cost',
@@ -821,12 +848,13 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         pd.DataFrame(all_details).to_csv(output/'apr_dispatch.csv', index=False)
         pd.DataFrame(all_dispatch).to_csv(output/'dispatch.csv', index=False)
 
-    def run(tag, model, weight, build_seconds, epsilon=None, cap=None, eps_setting=None, point_id=None):
+    def run(tag, model, weight, build_seconds, epsilon=None, cap=None, eps_setting=None, point_id=None, first_stage=None):
         budgeted = cap is not None
         cap_text = json.dumps(cap) if isinstance(cap, dict) else (f'{cap:.8f}' if budgeted else '')
         print(f'Solving {tag}, W={weight:g}' + (f', point={point_id}, base increase={100*epsilon:g}%, cap={cap_text}' if budgeted else ''), flush=True)
         r, vector = solve_model(model, weight, args)
-        r.update(model=tag, objective_kind={'signal':'signal_only','thermal-signal':'thermal_plus_signal','apr-slack':'apr_slack_sum','operating':'original_cost_under_budgets'}[args.budget_objective] if budgeted else 'original_plus_signal',
+        objective = 'operating' if first_stage is not None else args.budget_objective
+        r.update(model=tag, objective_kind={'signal':'signal_only','thermal-signal':'thermal_plus_signal','apr-slack':'apr_slack_sum','operating':'original_cost_under_budgets'}[objective] if budgeted else 'original_plus_signal',
                  shared_matrix_build_seconds=build_seconds, thermal_mode=args.thermal_mode,
                  gamma=args.gamma, demand_scale=args.demand_scale, reference_cost=refcost,
                  budget_increase=epsilon, budget_mode=args.budget_mode if budgeted else None,
@@ -842,15 +870,17 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
             tv = perf_counter()
             metrics, checks, details, dispatch = analyze(case, outages, model, vector, args, tag, weight)
             r.update(metrics)
+            if model.splus is not None:
+                r['both_APR_slacks_positive_pairs'] = int(np.count_nonzero(np.minimum(vector[model.splus], vector[model.sminus])*case['base'] > args.apr_tol_mw))
             r['original_plus_signal_objective'] = metrics['penalized_objective']
             if budgeted:
-                r['penalized_objective'] = metrics['apr_slack_sum_pu'] if args.budget_objective=='apr-slack' else metrics['signal_penalty']
-                if args.budget_objective == 'thermal-signal':
+                r['penalized_objective'] = metrics['apr_slack_sum_pu'] if objective=='apr-slack' else metrics['signal_penalty']
+                if objective == 'thermal-signal':
                     r['penalized_objective'] += metrics['operating_objective']-metrics['generation_cost']
-                elif args.budget_objective == 'operating':
+                elif objective == 'operating':
                     r['penalized_objective'] = metrics['operating_objective']
                 r['optimized_budget_objective'] = r['penalized_objective']
-                r['optimized_budget_objective_units'] = {'signal':'dimensionless','thermal-signal':'original_objective_cost_units','apr-slack':'per_unit_power_sum','operating':'original_objective_cost_units'}[args.budget_objective]
+                r['optimized_budget_objective_units'] = {'signal':'dimensionless','thermal-signal':'original_objective_cost_units','apr-slack':'per_unit_power_sum','operating':'original_objective_cost_units'}[objective]
                 r['budget_constraint_cost_with_solver_slacks'] = float(model.original_cost@vector+model.original_constant)
                 diagnostics = budget_diagnostics(metrics, cap, args)
                 r.update({'provisional_'+key: value for key,value in diagnostics.items()})
@@ -861,6 +891,20 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                 if metrics.get('recovery_success'):
                     r.update(budget_diagnostics(metrics, cap, args, prefix='recovered_'))
                     r['recovered_APR_and_budget_feasible'] = bool(metrics.get('recovered_original_APR_feasible') and r['recovered_budget_satisfied'])
+            if first_stage is not None:
+                limit = first_stage['apr_slack_sum_pu']+args.slack_preserve_tol
+                actual = metrics['apr_slack_sum_pu']
+                allowance = 1e-8*max(1.0, abs(limit))
+                preserved = actual <= limit+allowance
+                r.update(stage1_slack_optimum_pu=first_stage['apr_slack_sum_pu'],
+                         slack_preserve_tolerance_pu=args.slack_preserve_tol,
+                         slack_preserve_limit_pu=limit, slack_preserved=preserved,
+                         slack_preserve_validation_allowance_pu=allowance,
+                         stage1_operating_objective=first_stage['operating_objective'],
+                         operating_cost_reduction=first_stage['operating_objective']-metrics['operating_objective'],
+                         stage1_solve_seconds=first_stage['total_seconds'])
+                r['solver_point_verified'] = bool(r['solver_point_verified'] and preserved)
+                r['provisional_APR_and_budget_feasible'] &= r['solver_point_verified']
             r['provisional_original_APR_feasible'] &= r['solver_point_verified']
             if not r['solver_point_verified']: r['status'] = 'validation_failed'
             r['validation_seconds'] = perf_counter()-tv
@@ -873,7 +917,9 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                         record.update({'epsilon_'+name: value for name,value in eps_setting.items()})
             all_checks.extend(checks); all_details.extend(details); all_dispatch.extend(dispatch)
         r['pipeline_seconds'] = preprocess+(reference_seconds if budgeted else 0.0)+build_seconds+r['total_seconds']+r.get('validation_seconds', 0.0)
-        r['pipeline_is_candidate_method'] = tag == 'budget_LP'
+        if first_stage is not None:
+            r['pipeline_seconds'] = first_stage['pipeline_seconds']+build_seconds+r['total_seconds']+r.get('validation_seconds', 0.0)
+        r['pipeline_is_candidate_method'] = tag in ('budget_LP','budget_LP_cost')
         rows.append(r); save_progress()
         print(f'  status={r["status"]}; solve={r["total_seconds"]:.4f}s; pipeline={r["pipeline_seconds"]:.4f}s; original cost={r.get("operating_objective", float("nan")):.8f}; APR error={r.get("max_APR_L1_error_MW", float("nan")):.6g} MW; optimized objective={r.get("optimized_budget_objective", r.get("penalized_objective", float("nan"))):.10g}', flush=True)
         if budgeted and isinstance(cap, dict) and vector is not None:
@@ -932,7 +978,15 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         epsilon, eps, cap, point_id = point['base_epsilon'], point['epsilons'], point['caps'], point['budget_point']
         t = perf_counter(); model = budget_model(candidate_lp, cap, args.budget_objective); build = candidate_lp_build+perf_counter()-t
         for weight in weights:
-            run('budget_LP', model, weight, build, epsilon, cap, eps, point_id)
+            first = run('budget_LP', model, weight, build, epsilon, cap, eps, point_id)
+            if args.lexicographic_cost:
+                if first['status']=='optimal' and first.get('solver_point_verified'):
+                    t=perf_counter()
+                    second_model=preserve_slack_optimum(model, first['apr_slack_sum_pu'], args.slack_preserve_tol)
+                    second_build=perf_counter()-t
+                    run('budget_LP_cost', second_model, 0.0, second_build, epsilon, cap, eps, point_id, first_stage=first)
+                else:
+                    print('Stage two skipped: stage one did not produce a verified slack optimum.', flush=True)
         if args.compare_weighted_exact:
             t = perf_counter(); emodel = budget_model(candidate_exact, cap, args.budget_objective); ebuild = candidate_exact_build+perf_counter()-t
             for weight in weights:
@@ -981,7 +1035,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
     summary = pd.DataFrame(rows)
     sweep_rows = []
     for r in rows:
-        if r['model'] != 'budget_LP': continue
+        if r['model'] not in ('budget_LP','budget_LP_cost'): continue
         point = r.copy()
         candidates = []
         if r.get('provisional_APR_and_budget_feasible'): candidates.append(r['operating_objective'])
@@ -989,6 +1043,29 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
         point['has_APR_and_budget_feasible_candidate'] = bool(candidates)
         point['budget_feasible_candidate_cost'] = min(candidates) if candidates else None
         sweep_rows.append(point)
+    if args.lexicographic_cost:
+        comparison = []
+        for second in rows:
+            if second['model'] != 'budget_LP_cost': continue
+            first = next(r for r in rows if r['model']=='budget_LP' and r['budget_point']==second['budget_point'])
+            comparison.append(dict(budget_point=second['budget_point'],
+                stage1_slack_objective_pu=first.get('apr_slack_sum_pu'),
+                stage2_slack_objective_pu=second.get('apr_slack_sum_pu'),
+                slack_preserved=second.get('slack_preserved'),
+                stage1_operating_cost=first.get('operating_objective'),
+                stage2_operating_cost=second.get('operating_objective'),
+                operating_cost_reduction=second.get('operating_cost_reduction'),
+                stage1_both_slacks_positive_pairs=first.get('both_APR_slacks_positive_pairs'),
+                stage2_both_slacks_positive_pairs=second.get('both_APR_slacks_positive_pairs'),
+                stage1_APR_mismatch_MW=first.get('max_APR_L1_error_MW'),
+                stage2_APR_mismatch_MW=second.get('max_APR_L1_error_MW'),
+                stage2_APR_and_budget_feasible=second.get('provisional_APR_and_budget_feasible'),
+                stage1_solve_seconds=first['total_seconds'], stage2_solve_seconds=second['total_seconds'],
+                both_stage_solve_seconds=first['total_seconds']+second['total_seconds'],
+                complete_candidate_pipeline_seconds=second['pipeline_seconds']))
+        pd.DataFrame(comparison).to_csv(output/'lexicographic_comparison.csv', index=False)
+        print('Two-stage comparison (APR consistency must be checked again):')
+        print(pd.DataFrame(comparison).to_string(index=False))
     sweep = pd.DataFrame(sweep_rows)
     sweep.to_csv(output/'epsilon_results.csv', index=False)
     feasible = sweep[sweep.has_APR_and_budget_feasible_candidate].sort_values('budget_feasible_candidate_cost')
@@ -1029,6 +1106,8 @@ def parser():
     p.add_argument('--tee', action='store_true')
     p.add_argument('--budget-increase', nargs='+', type=float, help='Enable budget experiments; 0.10 means at most 10 percent above the reference cost. Accepts several fractions.')
     p.add_argument('--budget-objective', choices=['signal','thermal-signal','apr-slack','operating'], default='signal', help='signal: min sum(z). apr-slack: min sum(splus+sminus). operating: diagnostic min original cost under budgets. thermal-signal: earlier weighted objective.')
+    p.add_argument('--lexicographic-cost', action='store_true', help='After a verified apr-slack LP optimum, minimize original operating cost preserving its slack sum. Both stages validated independently.')
+    p.add_argument('--slack-preserve-tol', type=float, default=1e-7, help='Allowed absolute increase in stage-one slack sum, in per-unit aggregate power (default 1e-7).')
     p.add_argument('--reference-opf', choices=['nominal','line','envelope'], default='line', help='nominal/line omit generator outages; envelope includes full continuous generator-APR relaxation and is required for split budgets.')
     p.add_argument('--budget-mode', choices=['joint','split'], default='joint', help='joint: combined cost cap; split: separate generation, base+line thermal, and generator-outage thermal caps.')
     p.add_argument('--epsilon-g', type=float, help='Generation-cost relative increase in split mode; otherwise use --budget-increase.')
@@ -1046,6 +1125,10 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.lexicographic_cost and (args.budget_objective != 'apr-slack' or args.budget_increase is None):
+        raise ValueError('--lexicographic-cost requires --budget-objective apr-slack and --budget-increase')
+    if not np.isfinite(args.slack_preserve_tol) or args.slack_preserve_tol < 0:
+        raise ValueError('--slack-preserve-tol must be finite and nonnegative')
     if not np.isfinite(args.gamma) or not 0 <= args.gamma <= 1:
         raise ValueError('gamma must be in [0,1] for this APR model and its exact MILP linearization')
     for key in ('demand_scale','penalty','time_limit','apr_tol_mw','feas_tol_mw'):
