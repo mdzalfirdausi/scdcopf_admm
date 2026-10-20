@@ -2,6 +2,8 @@
 """APR experiments with individual and/or aggregate thermal-slack limits.
 
 New options in this standalone version:
+  --no-generation-budget: diagnostic with NO C_g cap. Requires direct eta
+    limits and --thermal-cost-budgets off; generation output bounds remain.
   --thermal-cost-budgets off: replace C_l/C_u caps with direct eta limits;
     keep the generation-cost cap. Requires --budget-mode split.
   --eta-line-fraction DELTA: eta <= DELTA*rating on EACH monitored line
@@ -711,7 +713,7 @@ def budget_diagnostics(metrics, caps, args, prefix=''):
         result[prefix+name+'_budget_cap'] = cap
         result[prefix+name+'_budget_violation'] = error
         result[prefix+name+'_budget_satisfied'] = bool(error <= tolerance)
-    result[prefix+'budget_violation'] = max(result[prefix+n+'_budget_violation'] for n in caps)
+    result[prefix+'budget_violation'] = max((result[prefix+n+'_budget_violation'] for n in caps), default=0.0)
     result[prefix+'budget_satisfied'] = all(result[prefix+n+'_budget_satisfied'] for n in caps)
     return result
 
@@ -952,7 +954,12 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
     metadata['eta_limit_settings'] = {key:value for key,value in vars(args).items() if key.startswith('eta_')}
     if args.thermal_cost_budgets == 'off':
         metadata['budget_definition'] = 'Generation-cost cap plus explicit individual and/or aggregate thermal-slack limits; no C_l or C_u cost caps'
-        print('Thermal COST budgets OFF: retaining C_g cap and using direct eta limits instead.', flush=True)
+        print('Thermal COST budgets OFF: using direct eta limits instead.' +
+              (' C_g cap retained.' if not args.no_generation_budget else ''), flush=True)
+    metadata['generation_budget_enabled'] = not args.no_generation_budget
+    if args.no_generation_budget:
+        metadata['budget_definition'] = 'Direct eta limits ONLY; no generation or thermal cost caps. Generator output bounds, balance and APR envelope remain.'
+        print('DIAGNOSTIC: generation COST cap also OFF; only direct eta limits restrict overloads. Physical generation bounds remain.', flush=True)
     print('Direct eta settings: ' + json.dumps(metadata['eta_limit_settings']), flush=True)
     save_meta()
 
@@ -978,7 +985,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                  cost_budget=total_cost_cap(cap), candidate_guarantee_applicable=False,
                  external_reference_time_excluded=args.reference_cost is not None)
         if budgeted and isinstance(cap, dict):
-            r.update(epsilon_generation=eps_setting['generation'],
+            r.update(epsilon_generation=eps_setting['generation'] if not args.no_generation_budget else None,
                      epsilon_line=eps_setting['line'] if args.thermal_cost_budgets=='on' else None,
                      epsilon_unit=eps_setting['unit'] if args.thermal_cost_budgets=='on' else None,
                      absolute_line_allowance=args.line_allowance, absolute_unit_allowance=args.unit_allowance)
@@ -1042,7 +1049,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                                   budget_point=point_id, cost_budget=total_cost_cap(cap))
                     if isinstance(cap, dict):
                         record.update({name+'_budget_cap': value for name,value in cap.items()})
-                        record.update({'epsilon_'+name: value if name=='generation' or args.thermal_cost_budgets=='on' else None for name,value in eps_setting.items()})
+                        record.update({'epsilon_'+name: value if (name=='generation' and not args.no_generation_budget) or (name!='generation' and args.thermal_cost_budgets=='on') else None for name,value in eps_setting.items()})
             all_checks.extend(checks); all_details.extend(details); all_dispatch.extend(dispatch)
         r['pipeline_seconds'] = preprocess+(reference_seconds if budgeted else 0.0)+build_seconds+r['total_seconds']+r.get('validation_seconds', 0.0)
         if first_stage is not None:
@@ -1087,6 +1094,8 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
                 cap['line'] += args.line_allowance; cap['unit'] += args.unit_allowance
                 if args.thermal_cost_budgets == 'off':
                     cap = {'generation': cap['generation']}
+                if args.no_generation_budget:
+                    cap.pop('generation', None)
                 key = tuple(cap.values())
             else:
                 cap = (1.0+epsilon)*refcost
@@ -1242,6 +1251,7 @@ def parser():
     p.add_argument('--reference-opf', choices=['nominal','line','envelope'], default='line', help='nominal/line omit generator outages; envelope includes full continuous generator-APR relaxation and is required for split budgets.')
     p.add_argument('--budget-mode', choices=['joint','split'], default='joint', help='joint: combined cost cap; split: separate generation, base+line thermal, and generator-outage thermal caps.')
     p.add_argument('--thermal-cost-budgets', choices=['on','off'], default='on', help='off: remove C_l and C_u cost caps in split mode; retain C_g cap and require explicit direct eta limits. on preserves existing cost budgets.')
+    p.add_argument('--no-generation-budget', action='store_true', help='Diagnostic: remove C_g cost cap too. Requires --thermal-cost-budgets off and direct eta limits. Physical generation bounds stay active.')
     for family, description in [('line','nominal and line-outage states'), ('unit','generator-outage states')]:
         individual = p.add_mutually_exclusive_group()
         individual.add_argument('--eta-'+family+'-mw', type=float, help='Maximum overload in MW on EACH monitored line in '+description+'.')
@@ -1273,6 +1283,11 @@ def main():
             raise ValueError('--thermal-cost-budgets off requires --budget-mode split and at least one direct eta limit')
         if any(getattr(args,key) is not None for key in ('epsilon_line','epsilon_unit','epsilon_line_grid','epsilon_unit_grid')) or args.line_allowance or args.unit_allowance:
             raise ValueError('Thermal cost-budget epsilons/allowances do not apply when --thermal-cost-budgets off. Use --eta-... options instead.')
+    if args.no_generation_budget:
+        if args.thermal_cost_budgets != 'off':
+            raise ValueError('--no-generation-budget requires --thermal-cost-budgets off and direct eta limits')
+        if args.epsilon_g is not None or args.epsilon_g_grid is not None:
+            raise ValueError('Generation epsilon does not apply with --no-generation-budget; remove --epsilon-g / --epsilon-g-grid')
     if args.lexicographic_cost and (args.budget_objective != 'apr-slack' or args.budget_increase is None):
         raise ValueError('--lexicographic-cost requires --budget-objective apr-slack and --budget-increase')
     if not np.isfinite(args.slack_preserve_tol) or args.slack_preserve_tol < 0:
