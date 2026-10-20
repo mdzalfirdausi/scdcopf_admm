@@ -2,6 +2,9 @@
 """APR experiments with individual and/or aggregate thermal-slack limits.
 
 New options in this standalone version:
+  --min-eta-fraction: standalone diagnostic min delta with eta_{k,j} <=
+    delta*rating_j on EVERY monitored line/state, no cost caps. Optional
+    --compare-exact also minimizes delta in the original APR MILP.
   --no-generation-budget: diagnostic with NO C_g cap. Requires direct eta
     limits and --thermal-cost-budgets off; generation output bounds remain.
   --thermal-cost-budgets off: replace C_l/C_u caps with direct eta limits;
@@ -300,6 +303,7 @@ class LinearModel:
     original_cost: object = None
     original_constant: object = None
     eta_records: object = None
+    eta_delta: object = None
 
 
 def network_blocks(case, include_lines):
@@ -500,6 +504,8 @@ def solve_model(model, weight, args):
         result['solver_penalized_objective'] = float(q @ vector + model.constant)
         dimensionless = np.zeros(len(vector), dtype=bool)
         dimensionless[model.z] = True
+        if model.eta_delta is not None:
+            dimensionless[model.eta_delta] = True
         if model.x: dimensionless[list(model.x.values())] = True
         power = ~dimensionless
         row_power = np.ones(model.A.shape[0], dtype=bool) if model.row_is_power is None else model.row_is_power
@@ -866,6 +872,117 @@ def total_cost_cap(cap):
     if isinstance(cap, dict):
         return sum(cap.values()) if set(cap)=={'generation','line','unit'} else None
     return cap
+
+
+def minimum_eta_fraction_model(model, case):
+    """min delta >= 0, eta_{k,j} - rating_j*delta <= 0. No cost caps.
+
+    delta is dimensionless. The LP version retains the APR envelope; the
+    optional exact version retains all original APR binaries/constraints.
+    """
+    if not model.eta_records:
+        raise ValueError('Minimum-fraction diagnostic requires monitored lines and soft thermal slacks')
+    n = len(model.c0)
+    count = len(model.eta_records)
+    rr = np.repeat(np.arange(count), 2)
+    cc = np.array([[index, n] for index, family, state, j in model.eta_records]).ravel()
+    vv = np.array([[1.0, -case['rates'][j]] for index, family, state, j in model.eta_records]).ravel()
+    extra = sparse.coo_matrix((vv, (rr, cc)), shape=(count, n+1)).tocsc()
+    old = sparse.hstack([model.A, sparse.csc_matrix((model.A.shape[0], 1))], format='csc')
+    row_power = np.ones(model.A.shape[0], dtype=bool) if model.row_is_power is None else model.row_is_power
+    return replace(model, A=sparse.vstack([old, extra], format='csc'),
+                   lower=np.r_[model.lower, np.full(count, -np.inf)],
+                   upper=np.r_[model.upper, np.zeros(count)],
+                   lb=np.r_[model.lb, 0.0], ub=np.r_[model.ub, np.inf],
+                   integer=np.r_[model.integer, 0], c0=np.r_[np.zeros(n), 1.0], constant=0.0,
+                   original_cost=np.r_[model.c0, 0.0], original_constant=model.constant,
+                   row_is_power=np.r_[row_power, np.ones(count, dtype=bool)], eta_delta=n)
+
+
+def run_minimum_eta_fraction(case, outages, args, fixed, output, metadata, preprocess):
+    started = perf_counter()
+    rows, all_checks, all_details, all_dispatch, all_eta = [], [], [], [], []
+    metadata.update(diagnostic='minimum_uniform_eta_fraction',
+                    optimized_objective='delta, with eta_{state,line} <= delta*rating_line',
+                    objective_units='dimensionless_fraction_of_each_line_rating',
+                    cost_caps_enabled=False, threshold_applies=False,
+                    bound_scope='fixed_dispatch' if fixed is not None else 'full_preventive_dispatch',
+                    warning='LP optimum is a lower bound on the allowance required by exact APR; it is not an operating-cost optimum.')
+    print('DIAGNOSTIC: minimize uniform overload fraction delta. NO cost caps; physical generation bounds remain.')
+    print('LP objective is delta, not sum(splus+sminus) and not operating cost.')
+    jobs = [('eta_fraction_LP', False)]
+    if args.compare_exact:
+        jobs.append(('eta_fraction_exact_APR', True))
+    for tag, exact in jobs:
+        t = perf_counter()
+        model = minimum_eta_fraction_model(build_model(case, outages, args, exact, fixed), case)
+        build_seconds = perf_counter()-t
+        print('Solving '+tag, flush=True)
+        result, vector = solve_model(model, 0.0, args)
+        result.update(model=tag, objective_kind='minimum_uniform_eta_fraction',
+                      optimized_objective_units='dimensionless', model_build_seconds=build_seconds,
+                      gamma=args.gamma, demand_scale=args.demand_scale,
+                      bound_scope=metadata['bound_scope'],
+                      uniform_fraction_solver_lower_bound=result['solver_best_bound_penalized'])
+        if vector is not None:
+            t = perf_counter()
+            fraction = float(vector[model.eta_delta])
+            metrics, checks, details, dispatch = analyze(case, outages, model, vector, args, tag, 0.0)
+            result.update(metrics)
+            result.update(optimized_uniform_fraction=fraction, optimized_uniform_percent=100*fraction,
+                          penalized_objective=fraction, optimized_objective=fraction)
+            check_args = copy.copy(args)
+            check_args.eta_line_fraction = fraction
+            check_args.eta_unit_fraction = fraction
+            diagnostics, eta_records = eta_limit_diagnostics(
+                case, outages, vector[model.g], vector[model.y], check_args)
+            result.update(diagnostics)
+            result['provisional_APR_and_eta_feasible'] = bool(result['solver_point_verified'] and
+                result['provisional_original_APR_feasible'] and result['eta_limits_satisfied'])
+            if metrics['recovery_success']:
+                recovered = [recover(case, vector[model.g], k,
+                    min(args.feas_tol_mw/case['base']/100, 1e-10))[0] for k in outages]
+                rec_diagnostics, rec_records = eta_limit_diagnostics(
+                    case, outages, vector[model.g], recovered, check_args, prefix='recovered_')
+                result.update(rec_diagnostics); eta_records.extend(rec_records)
+                result['recovered_APR_and_eta_feasible'] = bool(result['recovered_original_APR_feasible'] and
+                    result['recovered_eta_limits_satisfied'])
+            for record in eta_records:
+                record.update(model=tag, optimized_uniform_fraction=fraction)
+                record['relative_overload_fraction'] = record['minimum_eta_MW']/record['rating_MW']
+                record['at_fraction_limit'] = bool(abs(record['minimum_eta_MW']-fraction*record['rating_MW']) <= args.feas_tol_mw)
+            recovered_ratios = [record['relative_overload_fraction'] for record in eta_records if record['phase']=='recovered']
+            if recovered_ratios:
+                result['recovered_required_uniform_fraction'] = max(recovered_ratios)
+            all_checks.extend(checks); all_details.extend(details); all_dispatch.extend(dispatch); all_eta.extend(eta_records)
+            result['validation_seconds'] = perf_counter()-t
+            if not result['solver_point_verified']:
+                result['status'] = 'validation_failed'
+            print(f'  status={result["status"]}; minimum fraction={fraction:.10g} ({100*fraction:.6f}%); '
+                  f'APR mismatch={result["max_APR_L1_error_MW"]:.6g} MW; '
+                  f'APR+eta verified={result["provisional_APR_and_eta_feasible"]}', flush=True)
+        else:
+            print(f'  status={result["status"]}; {result.get("message", "")}', flush=True)
+        result['pipeline_seconds'] = preprocess+build_seconds+result['total_seconds']+result.get('validation_seconds', 0.0)
+        rows.append(result)
+        pd.DataFrame(rows).to_csv(output/'summary.csv', index=False)
+        pd.DataFrame(all_checks).to_csv(output/'apr_checks.csv', index=False)
+        pd.DataFrame(all_details).to_csv(output/'apr_dispatch.csv', index=False)
+        pd.DataFrame(all_dispatch).to_csv(output/'dispatch.csv', index=False)
+        if all_eta:
+            table = pd.DataFrame(all_eta)
+            table.to_csv(output/'eta_limit_checks.csv', index=False)
+            table[table.phase=='provisional'].sort_values('relative_overload_fraction', ascending=False).to_csv(output/'critical_lines.csv', index=False)
+    metadata['diagnostic_seconds_including_all_requested_solves'] = preprocess+perf_counter()-started
+    metadata['results'] = rows
+    (output/'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+    columns = ['model','status','optimized_uniform_fraction','optimized_uniform_percent','operating_objective',
+               'max_APR_L1_error_MW','provisional_APR_and_eta_feasible','recovered_APR_and_eta_feasible','total_seconds']
+    summary = pd.DataFrame(rows)
+    print(summary[[column for column in columns if column in summary]].to_string(index=False))
+    print('Saved: '+str(output.resolve()))
+    print('The LP allowance is a lower bound for exact APR. Check APR consistency and recovery limits separately.')
+    return 0 if all(row['status']=='optimal' for row in rows) else 2
 
 
 def run_budget_experiment(case, outages, args, fixed, output, metadata, preprocess, weights):
@@ -1252,6 +1369,7 @@ def parser():
     p.add_argument('--budget-mode', choices=['joint','split'], default='joint', help='joint: combined cost cap; split: separate generation, base+line thermal, and generator-outage thermal caps.')
     p.add_argument('--thermal-cost-budgets', choices=['on','off'], default='on', help='off: remove C_l and C_u cost caps in split mode; retain C_g cap and require explicit direct eta limits. on preserves existing cost budgets.')
     p.add_argument('--no-generation-budget', action='store_true', help='Diagnostic: remove C_g cost cap too. Requires --thermal-cost-budgets off and direct eta limits. Physical generation bounds stay active.')
+    p.add_argument('--min-eta-fraction', action='store_true', help='Standalone diagnostic: minimize delta with eta <= delta*rating on every monitored line/state, no cost caps. Optional --compare-exact solves the exact APR minimum-delta MILP too.')
     for family, description in [('line','nominal and line-outage states'), ('unit','generator-outage states')]:
         individual = p.add_mutually_exclusive_group()
         individual.add_argument('--eta-'+family+'-mw', type=float, help='Maximum overload in MW on EACH monitored line in '+description+'.')
@@ -1274,6 +1392,13 @@ def main():
     args = parser().parse_args()
     eta_values = [value for key,value in vars(args).items() if key.startswith('eta_')]
     eta_requested = any(value is not None for value in eta_values)
+    if args.min_eta_fraction:
+        if args.thermal_mode != 'soft' or args.budget_increase is not None or eta_requested or args.no_generation_budget or args.thermal_cost_budgets != 'on':
+            raise ValueError('--min-eta-fraction requires soft mode and replaces budget/direct-eta-cap options. Remove --budget-increase, --no-generation-budget, --thermal-cost-budgets off, and --eta-... caps.')
+        if args.compare_weighted_exact or args.lexicographic_cost or args.include_threshold:
+            raise ValueError('Minimum-fraction diagnostic supports --compare-exact; weighted/lexicographic/threshold modes do not apply.')
+        if any(getattr(args,key) is not None for key in ('epsilon_g','epsilon_line','epsilon_unit','epsilon_g_grid','epsilon_line_grid','epsilon_unit_grid','reference_cost')) or args.line_allowance or args.unit_allowance:
+            raise ValueError('Cost-budget epsilons, reference costs and allowances do not apply to --min-eta-fraction')
     if any(value is not None and (not np.isfinite(value) or value < 0) for value in eta_values):
         raise ValueError('Direct eta limits must be finite and nonnegative')
     if eta_requested and (args.budget_increase is None or args.thermal_mode != 'soft'):
@@ -1368,13 +1493,16 @@ def main():
     (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
     print(f'Case={path.name}; demand={case["D"]*case["base"]:g} MW; gamma={args.gamma:g}; solver={args.backend}')
     print(f'Generator outages={len(outages)}; line outages={metadata["line_contingencies"]}; excluded islanding={metadata["excluded_islanding"]}; mode={args.thermal_mode}')
-    print(f'Candidate soft-limit threshold B={B:.8g}; tested W={weights}')
-    print('NOTE: The proposed sufficient-weight argument concerns only SOFT limits with unbounded slacks and NO cost budget.')
+    if not args.min_eta_fraction:
+        print(f'Candidate soft-limit threshold B={B:.8g}; tested W={weights}')
+        print('NOTE: The proposed sufficient-weight argument concerns only SOFT limits with unbounded slacks and NO cost budget.')
     if np.any(case['gen'].c2.to_numpy(float)!=0): print('NOTE: c2 ignored; using linear c1 generation costs.')
     if any(r['capacity_shortage_MW']>args.feas_tol_mw for r in screen):
         print('INFEASIBLE: at least one outage leaves insufficient total surviving capacity. See capacity_screen.csv; thermal slacks cannot replace generation.')
         pd.DataFrame([dict(model='capacity_screen',status='infeasible_capacity')]).to_csv(output/'summary.csv',index=False)
         return 2
+    if args.min_eta_fraction:
+        return run_minimum_eta_fraction(case,outages,args,fixed,output,metadata,preprocess)
     if args.budget_increase is not None:
         return run_budget_experiment(case,outages,args,fixed,output,metadata,preprocess,weights)
     t=perf_counter(); lp=build_model(case,outages,args,False,fixed); lp_build=perf_counter()-t
