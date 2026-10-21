@@ -996,11 +996,20 @@ def run_minimum_eta_fraction(case, outages, args, fixed, output, metadata, prepr
 
 
 def normalized_slack_objective(model, case, weight, thermal_weight=1.0, normalization='capacity'):
-    """Professor's objective, using PU eta and dimensionless response slacks.
+        """Build the response-slack and thermal-slack objective.
 
-    LaTeX: min w sum_{k,i!=k}(splus_{k,i}+sminus_{k,i})/gmax_i
-                 + sum_{state,j} eta_{state,j}.
-    There is NO direct signal term, generation cost term, or M_eta factor.
+    normalization='capacity':
+        min weight * sum((splus+sminus)/gmax) + thermal_weight * sum(eta)
+
+    normalization='none':
+        min weight * sum(splus+sminus) + thermal_weight * sum(eta)
+
+    With --slack-normalization none --weights 1 in sweep mode:
+        min sum(splus+sminus) + sum(eta)
+
+    Thermal slacks include nominal, line-outage, and generator-outage states.
+    Power quantities are expressed in per unit.
+    Generation cost, a direct signal penalty, and M_eta are not included.
     """
     denominators = (np.array([case['hi'][i] for s,i in model.slack_pairs])
                     if normalization == 'capacity' else np.ones(len(model.slack_pairs)))
