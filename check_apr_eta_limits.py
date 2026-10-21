@@ -2,6 +2,8 @@
 """APR experiments with individual and/or aggregate thermal-slack limits.
 
 New options in this standalone version:
+  --slack-normalization none: remove division by generator capacity in the
+    standalone slack-only diagnostic or weighted sweep. Default: capacity.
   --normalized-slack-only: targeted diagnostic minimizing ONLY
     sum((splus+sminus)/Pmax), first in the LP and then in the exact APR MILP.
     No eta objective and no cost budgets. Both solve the SAME objective.
@@ -993,14 +995,15 @@ def run_minimum_eta_fraction(case, outages, args, fixed, output, metadata, prepr
     return 0 if all(row['status']=='optimal' for row in rows) else 2
 
 
-def normalized_slack_objective(model, case, weight, thermal_weight=1.0):
+def normalized_slack_objective(model, case, weight, thermal_weight=1.0, normalization='capacity'):
     """Professor's objective, using PU eta and dimensionless response slacks.
 
     LaTeX: min w sum_{k,i!=k}(splus_{k,i}+sminus_{k,i})/gmax_i
                  + sum_{state,j} eta_{state,j}.
     There is NO direct signal term, generation cost term, or M_eta factor.
     """
-    denominators = np.array([case['hi'][i] for s,i in model.slack_pairs])
+    denominators = (np.array([case['hi'][i] for s,i in model.slack_pairs])
+                    if normalization == 'capacity' else np.ones(len(model.slack_pairs)))
     if np.any(denominators<=0):
         raise ValueError('Slack normalization requires strictly positive surviving generator capacities')
     q = np.zeros_like(model.c0)
@@ -1015,6 +1018,11 @@ def normalized_slack_objective(model, case, weight, thermal_weight=1.0):
 def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, preprocess):
     started = perf_counter()
     pure = args.normalized_slack_only
+    normalization = args.slack_normalization
+    stem = 'normalized' if normalization == 'capacity' else 'unnormalized'
+    response_expression = 'sum((splus+sminus)/gmax)' if normalization == 'capacity' else 'sum(splus+sminus)'
+    lp_tag = stem + ('_slack_only_LP' if pure else '_slack_LP')
+    exact_tag = stem + '_slack_exact_APR' if pure else 'same_limits_exact_APR'
     weights = [1.0] if pure else sorted(set(args.weights), reverse=True)
     t = perf_counter()
     base_lp = apply_eta_limits(add_apr_slacks(build_model(case,outages,args,False,fixed),case,outages),case,args)
@@ -1024,32 +1032,33 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
         t = perf_counter()
         control = apply_eta_limits(add_apr_slacks(build_model(case,outages,args,True,fixed),case,outages),case,args)
         if pure:
-            control = normalized_slack_objective(control,case,1.0,thermal_weight=0.0)
-        jobs.append(('normalized_slack_exact_APR' if pure else 'same_limits_exact_APR',
+            control = normalized_slack_objective(control,case,1.0,thermal_weight=0.0,normalization=normalization)
+        jobs.append((exact_tag,
                      1.0 if pure else None,control,perf_counter()-t))
     for weight in weights:
         t = perf_counter()
-        jobs.append(('normalized_slack_only_LP' if pure else 'normalized_slack_LP',weight,
-                     normalized_slack_objective(base_lp,case,weight,thermal_weight=0.0 if pure else 1.0),
+        jobs.append((lp_tag,weight,
+                     normalized_slack_objective(base_lp,case,weight,thermal_weight=0.0 if pure else 1.0,normalization=normalization),
                      shared_build+perf_counter()-t))
     if pure:
-        jobs.sort(key=lambda job:job[0]=='normalized_slack_exact_APR')
-    metadata.update(experiment='normalized_response_slack_weight_sweep', weights=weights,
-                    optimized_objective='w*sum((splus+sminus)/gmax) + sum(eta_pu)',
+        jobs.sort(key=lambda job:job[0]==exact_tag)
+    metadata.update(experiment=stem+'_response_slack_weight_sweep', weights=weights,
+                    slack_normalization=normalization,
+                    optimized_objective='w*'+response_expression+' + sum(eta_pu)',
                     thermal_objective_units='per-unit overload summed over modeled lines and states',
                     direct_eta_limits={key:value for key,value in vars(args).items() if key.startswith('eta_')},
                     generation_cost_in_objective=False, cost_caps_enabled=False, threshold_applies=False,
                     comparator='Exact APR minimum ORIGINAL operating cost under the same direct eta limits, if requested',
                     warning='Large w does not guarantee APR consistency. All requested weights are tested; no monotone acceptance claim.')
     if pure:
-        metadata.update(experiment='same_objective_normalized_slack_LP_MILP_diagnostic',
-                        optimized_objective='sum((splus+sminus)/gmax) ONLY; eta and generation cost have zero coefficients',
-                        comparator='Exact APR MILP minimizes the SAME normalized slack sum as the LP',
-                        weights=[], warning='This compares normalized-slack optima, NOT original operating-cost optima.')
-        print('DIAGNOSTIC: BOTH models minimize sum((splus+sminus)/gmax) ONLY.')
+        metadata.update(experiment='same_objective_'+stem+'_slack_LP_MILP_diagnostic',
+                        optimized_objective=response_expression+' ONLY; eta and generation cost have zero coefficients',
+                        comparator='Exact APR MILP minimizes the SAME response-slack objective as the LP',
+                        weights=[], warning='This compares response-slack optima, NOT original operating-cost optima.')
+        print('DIAGNOSTIC: BOTH models minimize '+response_expression+' ONLY.')
         print('No thermal-slack objective, generation-cost objective, cost budgets or signal penalty.')
     else:
-        print('OBJECTIVE: w*sum((splus+sminus)/gmax) + sum(eta_pu). No generation-cost term or cost caps.')
+        print('OBJECTIVE: w*'+response_expression+' + sum(eta_pu). No generation-cost term or cost caps.')
         print('Weight order (high to low): '+str(weights))
         print('Every weight is checked; a failed APR check does not stop the sweep.')
     rows, all_checks, all_details, all_dispatch, all_eta = [], [], [], [], []
@@ -1059,23 +1068,28 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
         # w is already in q on s+/s-. Passing w here would wrongly add w*sum(z).
         result, vector = solve_model(model, 0.0, args)
         result.update(model=tag, weight=None if pure else weight, slack_weight=None if pure else weight,
-                      objective_kind='normalized_response_slacks_ONLY' if pure else 'normalized_response_slacks_plus_eta' if weight is not None else 'original_cost_same_eta_limits',
+                      objective_kind=stem+'_response_slacks_ONLY' if pure else stem+'_response_slacks_plus_eta' if weight is not None else 'original_cost_same_eta_limits',
+                      slack_normalization=normalization,
                       model_build_seconds=build_seconds, gamma=args.gamma, demand_scale=args.demand_scale,
-                      cost_caps_enabled=False, exact_APR_enforced=tag in ('same_limits_exact_APR','normalized_slack_exact_APR'))
+                      cost_caps_enabled=False, exact_APR_enforced=tag==exact_tag)
         if vector is not None:
             t = perf_counter()
             metrics, checks, details, dispatch = analyze(case,outages,model,vector,args,tag,0.0)
             result.update(metrics)
             normalized = float(((vector[model.splus]+vector[model.sminus])/denominators).sum())
+            unnormalized = float((vector[model.splus]+vector[model.sminus]).sum())
+            selected_slacks = normalized if normalization == 'capacity' else unnormalized
             solver_eta = float(vector[model.eta_line].sum()+vector[model.eta_unit].sum())
             physical_eta = metrics['sum_overload_MW']/case['base']
             result.update(normalized_response_slack_sum=normalized,
+                          unnormalized_response_slack_sum_pu=unnormalized,
+                          objective_response_slack_sum=selected_slacks,
                           thermal_slack_sum_pu=physical_eta, solver_thermal_slack_sum_pu=solver_eta,
                           both_APR_slacks_positive_pairs=int(np.count_nonzero(
                               np.minimum(vector[model.splus],vector[model.sminus])*case['base']>args.apr_tol_mw)))
-            value = normalized if pure else weight*normalized+solver_eta if weight is not None else metrics['operating_objective']
+            value = selected_slacks if pure else weight*selected_slacks+solver_eta if weight is not None else metrics['operating_objective']
             result.update(optimized_objective=value, penalized_objective=value,
-                          optimized_objective_units='dimensionless_normalized_slack_sum' if pure else 'weighted_normalized_slacks_plus_pu_overload' if weight is not None else 'operating_cost',
+                          optimized_objective_units=('dimensionless_normalized_slack_sum' if normalization=='capacity' else 'per_unit_aggregate_response_slack') if pure else 'weighted_response_slacks_plus_pu_overload' if weight is not None else 'operating_cost',
                           solver_objective_reconstruction_error=abs(value-result['solver_penalized_objective']))
             diagnostics, eta_records = eta_limit_diagnostics(case,outages,vector[model.g],vector[model.y],args)
             result.update(diagnostics)
@@ -1096,7 +1110,7 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
             result['has_verified_candidate'] = bool(candidates)
             result['validation_seconds'] = perf_counter()-t
             if not result['solver_point_verified']:result['status']='validation_failed'
-            print(f'  status={result["status"]}; normalized slacks={normalized:.8g}; eta={physical_eta:.8g} pu; '
+            print(f'  status={result["status"]}; {stem} slacks={selected_slacks:.8g}; eta={physical_eta:.8g} pu; '
                   f'APR mismatch={metrics["max_APR_L1_error_MW"]:.6g} MW; both-positive pairs={result["both_APR_slacks_positive_pairs"]}; '
                   f'direct accepted={result["provisional_APR_and_eta_feasible"]}; cost={metrics["operating_objective"]:.8f}',flush=True)
         else:print(f'  status={result["status"]}; {result.get("message", "")}',flush=True)
@@ -1109,24 +1123,27 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
                       and row.get('provisional_APR_and_eta_feasible')),None)
     if benchmark:
         for row in rows:
-            if row['model']=='normalized_slack_LP' and row.get('has_verified_candidate'):
+            if row['model']==lp_tag and row.get('has_verified_candidate'):
                 row['verified_cost_difference_vs_same_limits_MILP'] = row['verified_candidate_operating_cost']-benchmark['operating_objective']
                 row['verified_relative_cost_difference_vs_same_limits_MILP'] = row['verified_cost_difference_vs_same_limits_MILP']/max(1.0,abs(benchmark['operating_objective']))
     table = pd.DataFrame(rows)
     table.to_csv(output/'summary.csv',index=False)
     if not pure:
-        table[table.model=='normalized_slack_LP'].to_csv(output/'weight_results.csv',index=False)
+        table[table.model==lp_tag].to_csv(output/'weight_results.csv',index=False)
     else:
-        lp = next(row for row in rows if row['model']=='normalized_slack_only_LP')
-        mip = next(row for row in rows if row['model']=='normalized_slack_exact_APR')
+        lp = next(row for row in rows if row['model']==lp_tag)
+        mip = next(row for row in rows if row['model']==exact_tag)
         diagnostic = dict(LP_status=lp['status'], exact_APR_status=mip['status'],
+                          slack_normalization=normalization,
+                          LP_response_slack_objective=lp.get('objective_response_slack_sum'),
+                          exact_APR_response_slack_objective=mip.get('objective_response_slack_sum'),
                           LP_normalized_slack=lp.get('normalized_response_slack_sum'),
                           exact_APR_normalized_slack=mip.get('normalized_response_slack_sum'),
                           exact_APR_solver_lower_bound=mip.get('solver_best_bound_penalized'),
                           conclusion='Inconclusive: inspect solver statuses, bounds and feasibility checks')
         if lp['status']=='optimal' and lp.get('solver_point_verified'):
-            lower = lp['normalized_response_slack_sum']
-            candidate = mip.get('normalized_response_slack_sum')
+            lower = lp['objective_response_slack_sum']
+            candidate = mip.get('objective_response_slack_sum')
             mip_bound = mip.get('solver_best_bound_penalized')
             tolerance = 1e-7*max(1.0,abs(lower),abs(candidate) if candidate is not None else 0.0)
             diagnostic['comparison_tolerance'] = tolerance
@@ -1135,17 +1152,17 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
             if mip_bound is not None:
                 diagnostic['certified_separation_using_MILP_bound'] = mip_bound-lower
             if mip.get('provisional_APR_and_eta_feasible') and candidate<=lower+tolerance:
-                diagnostic['conclusion'] = 'An APR-consistent normalized-slack optimum exists within numerical tolerance; LP solution selection may still matter'
+                diagnostic['conclusion'] = 'An APR-consistent response-slack optimum exists within numerical tolerance; inspect direct LP APR diagnostics too'
             elif mip_bound is not None and mip_bound>lower+tolerance:
-                diagnostic['conclusion'] = 'Strict normalized-slack relaxation gap: no APR-consistent point attains the LP minimum within numerical tolerance'
+                diagnostic['conclusion'] = 'Strict response-slack relaxation gap: no APR-consistent point attains the LP minimum within numerical tolerance'
         metadata['same_objective_diagnostic'] = diagnostic
-        pd.DataFrame([diagnostic]).to_csv(output/'normalized_slack_diagnostic.csv',index=False)
+        pd.DataFrame([diagnostic]).to_csv(output/(stem+'_slack_diagnostic.csv'),index=False)
         print('SAME-OBJECTIVE DIAGNOSTIC: '+json.dumps(diagnostic),flush=True)
     metadata.update(results=rows,
-                    sweep_solve_seconds=sum(row['total_seconds'] for row in rows if row['model'] in ('normalized_slack_LP','normalized_slack_only_LP')),
+                    sweep_solve_seconds=sum(row['total_seconds'] for row in rows if row['model']==lp_tag),
                     complete_experiment_seconds=preprocess+perf_counter()-started)
     (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
-    columns=['model','weight','status','normalized_response_slack_sum','thermal_slack_sum_pu','max_APR_L1_error_MW',
+    columns=['model','weight','status','objective_response_slack_sum','normalized_response_slack_sum','unnormalized_response_slack_sum_pu','thermal_slack_sum_pu','max_APR_L1_error_MW',
              'both_APR_slacks_positive_pairs','provisional_APR_and_eta_feasible','recovered_APR_and_eta_feasible',
              'operating_objective','verified_candidate_operating_cost','total_seconds']
     print(table[[column for column in columns if column in table]].to_string(index=False))
@@ -1540,6 +1557,7 @@ def parser():
     p.add_argument('--min-eta-fraction', action='store_true', help='Standalone diagnostic: minimize delta with eta <= delta*rating on every monitored line/state, no cost caps. Optional --compare-exact solves the exact APR minimum-delta MILP too.')
     p.add_argument('--normalized-slack-sweep', action='store_true', help='Standalone high-to-low sweep: min w*sum((splus+sminus)/gmax)+sum(eta_pu). Uses --weights, optional direct eta caps and --compare-exact (original cost, same caps). No cost budgets.')
     p.add_argument('--normalized-slack-only', action='store_true', help='Targeted diagnostic: solve LP AND exact-APR MILP minimizing ONLY sum((splus+sminus)/gmax). No thermal or generation cost objective. Optional direct eta caps apply equally to both.')
+    p.add_argument('--slack-normalization', choices=['capacity','none'], default='capacity', help='Standalone slack modes: capacity divides each slack pair by its generator Pmax (default); none minimizes the unnormalized sum instead. Applies equally to LP and exact-APR comparator.')
     for family, description in [('line','nominal and line-outage states'), ('unit','generator-outage states')]:
         individual = p.add_mutually_exclusive_group()
         individual.add_argument('--eta-'+family+'-mw', type=float, help='Maximum overload in MW on EACH monitored line in '+description+'.')
@@ -1560,6 +1578,8 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.slack_normalization!='capacity' and not (args.normalized_slack_sweep or args.normalized_slack_only):
+        raise ValueError('--slack-normalization none requires --normalized-slack-only or --normalized-slack-sweep')
     eta_values = [value for key,value in vars(args).items() if key.startswith('eta_')]
     eta_requested = any(value is not None for value in eta_values)
     if args.normalized_slack_sweep or args.normalized_slack_only:
