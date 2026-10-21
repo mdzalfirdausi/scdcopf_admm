@@ -18,7 +18,7 @@ import pandas as pd
 import pyomo.environ as pyo
 from pyomo.opt import TerminationCondition
 
-EXCEL_DIR = Path(r"M:\projects\excel_outputs")
+EXCEL_DIR = Path(r"../excel_outputs")
 
 def load_case(path, gamma=0.05, m_eta=1500.0):
     sheets = pd.read_excel(path, sheet_name=None)
