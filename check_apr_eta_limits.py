@@ -2,6 +2,11 @@
 """APR experiments with individual and/or aggregate thermal-slack limits.
 
 New options in this standalone version:
+  --normalized-slack-sweep: standalone LP sweep of the professor's objective
+    w*sum((splus+sminus)/Pmax) + sum(eta_pu). Weights run high to low;
+    no cost budgets or automatic complementarity constraints. Optional direct
+    eta limits remain hard constraints; --compare-exact minimizes original
+    operating cost in the exact APR MILP under the SAME direct eta limits.
   --min-eta-fraction: standalone diagnostic min delta with eta_{k,j} <=
     delta*rating_j on EVERY monitored line/state, no cost caps. Optional
     --compare-exact also minimizes delta in the original APR MILP.
@@ -985,6 +990,125 @@ def run_minimum_eta_fraction(case, outages, args, fixed, output, metadata, prepr
     return 0 if all(row['status']=='optimal' for row in rows) else 2
 
 
+def normalized_slack_objective(model, case, weight):
+    """Professor's objective, using PU eta and dimensionless response slacks.
+
+    LaTeX: min w sum_{k,i!=k}(splus_{k,i}+sminus_{k,i})/gmax_i
+                 + sum_{state,j} eta_{state,j}.
+    There is NO direct signal term, generation cost term, or M_eta factor.
+    """
+    denominators = np.array([case['hi'][i] for s,i in model.slack_pairs])
+    if np.any(denominators<=0):
+        raise ValueError('Slack normalization requires strictly positive surviving generator capacities')
+    q = np.zeros_like(model.c0)
+    q[model.splus] = weight/denominators
+    q[model.sminus] = weight/denominators
+    q[model.eta_line] = 1.0
+    q[model.eta_unit] = 1.0
+    return replace(model, c0=q, constant=0.0,
+                   original_cost=model.c0.copy(), original_constant=model.constant)
+
+
+def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, preprocess):
+    started = perf_counter()
+    weights = sorted(set(args.weights), reverse=True)
+    t = perf_counter()
+    base_lp = apply_eta_limits(add_apr_slacks(build_model(case,outages,args,False,fixed),case,outages),case,args)
+    shared_build = perf_counter()-t
+    jobs = []
+    if args.compare_exact:
+        t = perf_counter()
+        control = apply_eta_limits(add_apr_slacks(build_model(case,outages,args,True,fixed),case,outages),case,args)
+        jobs.append(('same_limits_exact_APR',None,control,perf_counter()-t))
+    for weight in weights:
+        t = perf_counter()
+        jobs.append(('normalized_slack_LP',weight,normalized_slack_objective(base_lp,case,weight),
+                     shared_build+perf_counter()-t))
+    metadata.update(experiment='normalized_response_slack_weight_sweep', weights=weights,
+                    optimized_objective='w*sum((splus+sminus)/gmax) + sum(eta_pu)',
+                    thermal_objective_units='per-unit overload summed over modeled lines and states',
+                    direct_eta_limits={key:value for key,value in vars(args).items() if key.startswith('eta_')},
+                    generation_cost_in_objective=False, cost_caps_enabled=False, threshold_applies=False,
+                    comparator='Exact APR minimum ORIGINAL operating cost under the same direct eta limits, if requested',
+                    warning='Large w does not guarantee APR consistency. All requested weights are tested; no monotone acceptance claim.')
+    print('OBJECTIVE: w*sum((splus+sminus)/gmax) + sum(eta_pu). No generation-cost term or cost caps.')
+    print('Weight order (high to low): '+str(weights))
+    print('Every weight is checked; a failed APR check does not stop the sweep.')
+    rows, all_checks, all_details, all_dispatch, all_eta = [], [], [], [], []
+    denominators = np.array([case['hi'][i] for s,i in base_lp.slack_pairs])
+    for tag, weight, model, build_seconds in jobs:
+        print(f'Solving {tag}' + (f', w={weight:g}' if weight is not None else ', original operating objective'), flush=True)
+        # w is already in q on s+/s-. Passing w here would wrongly add w*sum(z).
+        result, vector = solve_model(model, 0.0, args)
+        result.update(model=tag, weight=weight, slack_weight=weight,
+                      objective_kind='normalized_response_slacks_plus_eta' if weight is not None else 'original_cost_same_eta_limits',
+                      model_build_seconds=build_seconds, gamma=args.gamma, demand_scale=args.demand_scale,
+                      cost_caps_enabled=False, exact_APR_enforced=tag=='same_limits_exact_APR')
+        if vector is not None:
+            t = perf_counter()
+            metrics, checks, details, dispatch = analyze(case,outages,model,vector,args,tag,0.0)
+            result.update(metrics)
+            normalized = float(((vector[model.splus]+vector[model.sminus])/denominators).sum())
+            solver_eta = float(vector[model.eta_line].sum()+vector[model.eta_unit].sum())
+            physical_eta = metrics['sum_overload_MW']/case['base']
+            result.update(normalized_response_slack_sum=normalized,
+                          thermal_slack_sum_pu=physical_eta, solver_thermal_slack_sum_pu=solver_eta,
+                          both_APR_slacks_positive_pairs=int(np.count_nonzero(
+                              np.minimum(vector[model.splus],vector[model.sminus])*case['base']>args.apr_tol_mw)))
+            value = weight*normalized+solver_eta if weight is not None else metrics['operating_objective']
+            result.update(optimized_objective=value, penalized_objective=value,
+                          optimized_objective_units='weighted_normalized_slacks_plus_pu_overload' if weight is not None else 'operating_cost',
+                          solver_objective_reconstruction_error=abs(value-result['solver_penalized_objective']))
+            diagnostics, eta_records = eta_limit_diagnostics(case,outages,vector[model.g],vector[model.y],args)
+            result.update(diagnostics)
+            result['provisional_APR_and_eta_feasible'] = bool(result['solver_point_verified'] and
+                metrics['provisional_original_APR_feasible'] and result['eta_limits_satisfied'])
+            if metrics['recovery_success']:
+                recovered = [recover(case,vector[model.g],k,min(args.feas_tol_mw/case['base']/100,1e-10))[0] for k in outages]
+                rec_diagnostics, rec_records = eta_limit_diagnostics(case,outages,vector[model.g],recovered,args,prefix='recovered_')
+                result.update(rec_diagnostics);eta_records.extend(rec_records)
+                result['recovered_APR_and_eta_feasible'] = bool(metrics['recovered_original_APR_feasible'] and result['recovered_eta_limits_satisfied'])
+            for table in (checks,details,dispatch,eta_records):
+                for record in table:record.update(model=tag,weight=weight)
+            all_checks.extend(checks);all_details.extend(details);all_dispatch.extend(dispatch);all_eta.extend(eta_records)
+            candidates = []
+            if result['provisional_APR_and_eta_feasible']:candidates.append(metrics['operating_objective'])
+            if result.get('recovered_APR_and_eta_feasible'):candidates.append(metrics['recovered_operating_objective'])
+            result['verified_candidate_operating_cost'] = min(candidates) if candidates else None
+            result['has_verified_candidate'] = bool(candidates)
+            result['validation_seconds'] = perf_counter()-t
+            if not result['solver_point_verified']:result['status']='validation_failed'
+            print(f'  status={result["status"]}; normalized slacks={normalized:.8g}; eta={physical_eta:.8g} pu; '
+                  f'APR mismatch={metrics["max_APR_L1_error_MW"]:.6g} MW; both-positive pairs={result["both_APR_slacks_positive_pairs"]}; '
+                  f'direct accepted={result["provisional_APR_and_eta_feasible"]}; cost={metrics["operating_objective"]:.8f}',flush=True)
+        else:print(f'  status={result["status"]}; {result.get("message", "")}',flush=True)
+        result['pipeline_seconds'] = preprocess+build_seconds+result['total_seconds']+result.get('validation_seconds',0.0)
+        rows.append(result)
+        pd.DataFrame(rows).to_csv(output/'summary.csv',index=False)
+        for name,data in [('apr_checks',all_checks),('apr_dispatch',all_details),('dispatch',all_dispatch),('eta_limit_checks',all_eta)]:
+            pd.DataFrame(data).to_csv(output/(name+'.csv'),index=False)
+    benchmark = next((row for row in rows if row['model']=='same_limits_exact_APR' and row['status']=='optimal'
+                      and row.get('provisional_APR_and_eta_feasible')),None)
+    if benchmark:
+        for row in rows:
+            if row['model']=='normalized_slack_LP' and row.get('has_verified_candidate'):
+                row['verified_cost_difference_vs_same_limits_MILP'] = row['verified_candidate_operating_cost']-benchmark['operating_objective']
+                row['verified_relative_cost_difference_vs_same_limits_MILP'] = row['verified_cost_difference_vs_same_limits_MILP']/max(1.0,abs(benchmark['operating_objective']))
+    table = pd.DataFrame(rows)
+    table.to_csv(output/'summary.csv',index=False)
+    table[table.model=='normalized_slack_LP'].to_csv(output/'weight_results.csv',index=False)
+    metadata.update(results=rows,
+                    sweep_solve_seconds=sum(row['total_seconds'] for row in rows if row['model']=='normalized_slack_LP'),
+                    complete_experiment_seconds=preprocess+perf_counter()-started)
+    (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+    columns=['model','weight','status','normalized_response_slack_sum','thermal_slack_sum_pu','max_APR_L1_error_MW',
+             'both_APR_slacks_positive_pairs','provisional_APR_and_eta_feasible','recovered_APR_and_eta_feasible',
+             'operating_objective','verified_candidate_operating_cost','total_seconds']
+    print(table[[column for column in columns if column in table]].to_string(index=False))
+    print('Saved: '+str(output.resolve()))
+    return 0 if all(row['status']=='optimal' for row in rows) else 2
+
+
 def run_budget_experiment(case, outages, args, fixed, output, metadata, preprocess, weights):
     """Reference OPF -> cost-budget LP -> physical recovery; optional MILP controls."""
     wall_start = perf_counter()
@@ -1370,6 +1494,7 @@ def parser():
     p.add_argument('--thermal-cost-budgets', choices=['on','off'], default='on', help='off: remove C_l and C_u cost caps in split mode; retain C_g cap and require explicit direct eta limits. on preserves existing cost budgets.')
     p.add_argument('--no-generation-budget', action='store_true', help='Diagnostic: remove C_g cost cap too. Requires --thermal-cost-budgets off and direct eta limits. Physical generation bounds stay active.')
     p.add_argument('--min-eta-fraction', action='store_true', help='Standalone diagnostic: minimize delta with eta <= delta*rating on every monitored line/state, no cost caps. Optional --compare-exact solves the exact APR minimum-delta MILP too.')
+    p.add_argument('--normalized-slack-sweep', action='store_true', help='Standalone high-to-low sweep: min w*sum((splus+sminus)/gmax)+sum(eta_pu). Uses --weights, optional direct eta caps and --compare-exact (original cost, same caps). No cost budgets.')
     for family, description in [('line','nominal and line-outage states'), ('unit','generator-outage states')]:
         individual = p.add_mutually_exclusive_group()
         individual.add_argument('--eta-'+family+'-mw', type=float, help='Maximum overload in MW on EACH monitored line in '+description+'.')
@@ -1392,6 +1517,13 @@ def main():
     args = parser().parse_args()
     eta_values = [value for key,value in vars(args).items() if key.startswith('eta_')]
     eta_requested = any(value is not None for value in eta_values)
+    if args.normalized_slack_sweep:
+        if args.thermal_mode!='soft' or args.min_eta_fraction or args.budget_increase is not None or args.no_generation_budget or args.thermal_cost_budgets!='on':
+            raise ValueError('--normalized-slack-sweep requires soft mode and replaces budget modes. Remove --budget-increase, --no-generation-budget and --thermal-cost-budgets off.')
+        if args.compare_weighted_exact or args.lexicographic_cost or args.include_threshold:
+            raise ValueError('Normalized slack sweep supports --compare-exact, not weighted-exact, lexicographic or threshold modes.')
+        if any(getattr(args,key) is not None for key in ('epsilon_g','epsilon_line','epsilon_unit','epsilon_g_grid','epsilon_line_grid','epsilon_unit_grid','reference_cost')) or args.line_allowance or args.unit_allowance:
+            raise ValueError('Cost-budget epsilons/reference costs/allowances do not apply to --normalized-slack-sweep')
     if args.min_eta_fraction:
         if args.thermal_mode != 'soft' or args.budget_increase is not None or eta_requested or args.no_generation_budget or args.thermal_cost_budgets != 'on':
             raise ValueError('--min-eta-fraction requires soft mode and replaces budget/direct-eta-cap options. Remove --budget-increase, --no-generation-budget, --thermal-cost-budgets off, and --eta-... caps.')
@@ -1401,7 +1533,7 @@ def main():
             raise ValueError('Cost-budget epsilons, reference costs and allowances do not apply to --min-eta-fraction')
     if any(value is not None and (not np.isfinite(value) or value < 0) for value in eta_values):
         raise ValueError('Direct eta limits must be finite and nonnegative')
-    if eta_requested and (args.budget_increase is None or args.thermal_mode != 'soft'):
+    if eta_requested and ((args.budget_increase is None and not args.normalized_slack_sweep) or args.thermal_mode != 'soft'):
         raise ValueError('Direct eta limits require --thermal-mode soft and a budget experiment (--budget-increase)')
     if args.thermal_cost_budgets == 'off':
         if args.budget_mode != 'split' or not eta_requested:
@@ -1493,7 +1625,7 @@ def main():
     (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
     print(f'Case={path.name}; demand={case["D"]*case["base"]:g} MW; gamma={args.gamma:g}; solver={args.backend}')
     print(f'Generator outages={len(outages)}; line outages={metadata["line_contingencies"]}; excluded islanding={metadata["excluded_islanding"]}; mode={args.thermal_mode}')
-    if not args.min_eta_fraction:
+    if not args.min_eta_fraction and not args.normalized_slack_sweep:
         print(f'Candidate soft-limit threshold B={B:.8g}; tested W={weights}')
         print('NOTE: The proposed sufficient-weight argument concerns only SOFT limits with unbounded slacks and NO cost budget.')
     if np.any(case['gen'].c2.to_numpy(float)!=0): print('NOTE: c2 ignored; using linear c1 generation costs.')
@@ -1503,6 +1635,8 @@ def main():
         return 2
     if args.min_eta_fraction:
         return run_minimum_eta_fraction(case,outages,args,fixed,output,metadata,preprocess)
+    if args.normalized_slack_sweep:
+        return run_normalized_slack_sweep(case,outages,args,fixed,output,metadata,preprocess)
     if args.budget_increase is not None:
         return run_budget_experiment(case,outages,args,fixed,output,metadata,preprocess,weights)
     t=perf_counter(); lp=build_model(case,outages,args,False,fixed); lp_build=perf_counter()-t
