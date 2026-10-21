@@ -2,6 +2,9 @@
 """APR experiments with individual and/or aggregate thermal-slack limits.
 
 New options in this standalone version:
+  Fixed transformer phase shifts are supported through affine PTDF flow
+    offsets in nominal, generator-outage and line-outage states. The Excel
+    branch.angle values are degrees and are retained, not reset to zero.
   --slack-normalization none: remove division by generator capacity in the
     standalone slack-only diagnostic or weighted sweep. Default: capacity.
   --normalized-slack-only: targeted diagnostic minimizing ONLY
@@ -196,8 +199,8 @@ def load_case(path, demand_scale):
     for j, r in branch.iterrows():
         if r.bus_i not in bus_index or r.bus_j not in bus_index or r.bus_i == r.bus_j:
             raise ValueError('Invalid line endpoints')
-        if abs(float(r.angle)) > 1e-10:
-            raise ValueError('Nonzero transformer phase shifts are unsupported (affine flow offsets needed)')
+        if not np.isfinite(float(r.angle)):
+            raise ValueError('Nonfinite transformer phase shift')
         tap = 1.0 if float(r.ratio) == 0 else float(r.ratio)
         x = float(r.x)
         if not np.isfinite(x) or x == 0 or not np.isfinite(tap) or tap <= 0:
@@ -216,6 +219,13 @@ def load_case(path, demand_scale):
     inverse = np.zeros((n, n))
     inverse[np.ix_(keep, keep)] = np.linalg.solve(bbus[np.ix_(keep, keep)], np.eye(n - 1))
     ptdf = susceptance[:, None] * (incidence @ inverse)
+    # MATPOWER DC convention: f = Bf*theta + Pfinj,
+    # p = Bbus*theta + Pbusinj. Eliminating theta gives
+    # f = K*p + h, h = Pfinj - K*Pbusinj. Fixed shifts are in degrees.
+    phase_shift_rad = np.deg2rad(branch.angle.to_numpy(float))
+    phase_branch_injection = -susceptance * phase_shift_rad
+    phase_bus_injection = incidence.T @ phase_branch_injection
+    phase_flow_offset = phase_branch_injection - ptdf @ phase_bus_injection
     transfer = ptdf @ incidence.T
     den = 1.0 - np.diag(transfer)
     eligible = np.flatnonzero(np.abs(den) >= 1e-8)
@@ -240,7 +250,11 @@ def load_case(path, demand_scale):
     return dict(base=base, bus=bus, gen=gen, branch=branch, A=incidence, b=susceptance,
                 B=B, K=ptdf, L=lodf, eligible=eligible, excluded=excluded, ref=ref,
                 keep=keep, d=pd_pu, D=float(sum(pd_pu)), lo=lo, hi=hi,
-                rates=branch.rateA.to_numpy(float) / base)
+                rates=branch.rateA.to_numpy(float) / base,
+                phase_shift_rad=phase_shift_rad,
+                phase_branch_injection=phase_branch_injection,
+                phase_bus_injection=phase_bus_injection,
+                phase_flow_offset=phase_flow_offset)
 
 
 def id_key(value):
@@ -317,17 +331,20 @@ class LinearModel:
 
 
 def network_blocks(case, include_lines):
-    """Positive-injection PTDF orientation; symmetric rateA constraints."""
+    """Affine positive-injection PTDF flows, including fixed phase shifts."""
     ng = len(case['lo'])
     mon = np.flatnonzero(case['rates'] > 0)
     H = case['K'] @ case['B']
-    offset = -case['K'] @ case['d']
+    offset = case['phase_flow_offset'] - case['K'] @ case['d']
     blocks = [(-1, mon, H[mon], offset[mon])]
     if include_lines:
         for ell in case['eligible']:
             keep = mon[mon != ell]
             T = case['K'][keep] + np.outer(case['L'][keep, ell], case['K'][ell])
-            blocks.append((int(ell), keep, T @ case['B'], -(T @ case['d'])))
+            # Apply the LODF update to the FULL pre-outage flow, including h.
+            # This also handles removal of a phase-shifting transformer itself.
+            outage_offset = offset[keep] + case['L'][keep, ell] * offset[ell]
+            blocks.append((int(ell), keep, T @ case['B'], outage_offset))
     assert all(F.shape[1] == ng for _, _, F, _ in blocks)
     return H, offset, mon, blocks
 
@@ -400,14 +417,14 @@ def build_model(case, outages, args, exact=False, fixed=None):
     # LaTeX: \mathbf{1}^T g = D (nominal power balance).
     constraint(g, np.ones(ng), case['D'], case['D'])
     for ell, monitored, F, b in blocks:
-        # LaTeX (base): f^0=K(Bg-d).
+        # LaTeX (base): f^0=K(Bg-d)+h, fixed phase-shift offset h.
         # LaTeX (line outage ell): f_j^{L,ell}=f_j^0+L_{j,ell}f_ell^0,
         # j\ne ell; only non-islanding outages and rateA>0 lines are monitored.
         flow_constraints(g, monitored, F, b, state=ell)
     for s, k in enumerate(outages):
         # LaTeX: \mathbf{1}^T g_k = D (generator-outage power balance).
         constraint(y[s], np.ones(ng), case['D'], case['D'])
-        # LaTeX: f^{G,k}=K(Bg_k-d), with soft/hard thermal bounds above.
+        # LaTeX: f^{G,k}=K(Bg_k-d)+h, with soft/hard thermal bounds above.
         flow_constraints(y[s], mon, H[mon], offset[mon], family='unit', state=int(k))
         for i in range(ng):
             if i == k:
@@ -1679,6 +1696,9 @@ def main():
     metadata = dict(arguments=vars(args), case_path=str(path), python=sys.version, platform=platform.platform(),
                     numpy=np.__version__,scipy=scipy.__version__,pandas=pd.__version__,
                     input_preprocessing_seconds=preprocess, demand_MW=case['D']*case['base'],
+                    fixed_phase_shift_branches=int(np.count_nonzero(np.abs(case['phase_shift_rad'])>np.deg2rad(1e-10))),
+                    max_abs_phase_flow_offset_MW=float(np.max(np.abs(case['phase_flow_offset'])))*case['base'],
+                    flow_convention='f=K@(B@g-d)+h; fixed phase shifts retained in h; LODF applied to full flows',
                     generator_contingencies=[id_key(case['gen'].iloc[k].gen_ID) for k in outages],
                     line_contingencies=0 if args.no_line_contingencies else len(case['eligible']),
                     excluded_islanding=len(excluded) if not args.no_line_contingencies else 0,
@@ -1692,6 +1712,9 @@ def main():
     (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
     print(f'Case={path.name}; demand={case["D"]*case["base"]:g} MW; gamma={args.gamma:g}; solver={args.backend}')
     print(f'Generator outages={len(outages)}; line outages={metadata["line_contingencies"]}; excluded islanding={metadata["excluded_islanding"]}; mode={args.thermal_mode}')
+    if metadata['fixed_phase_shift_branches']:
+        print(f'Fixed phase shifts retained: {metadata["fixed_phase_shift_branches"]} active branch(es); '
+              f'max |h|={metadata["max_abs_phase_flow_offset_MW"]:.6g} MW')
     if not args.min_eta_fraction and not (args.normalized_slack_sweep or args.normalized_slack_only):
         print(f'Candidate soft-limit threshold B={B:.8g}; tested W={weights}')
         print('NOTE: The proposed sufficient-weight argument concerns only SOFT limits with unbounded slacks and NO cost budget.')
