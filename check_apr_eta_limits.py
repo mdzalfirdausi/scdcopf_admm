@@ -147,6 +147,8 @@ Candidate outputs are labeled separately from recovered original-APR outputs.
 A numerical sweep illustrates a result; it does not prove a theorem or novelty.
 """
 import argparse
+from array import array
+import shutil
 from dataclasses import dataclass
 from dataclasses import replace
 import copy
@@ -157,7 +159,11 @@ import json
 from pathlib import Path
 import platform
 import sys
+import faulthandler
 import traceback
+
+if __name__ == "__main__":
+    faulthandler.enable(all_threads=True)
 from contextlib import contextmanager, ExitStack
 from tempfile import NamedTemporaryFile
 from time import perf_counter
@@ -166,6 +172,8 @@ import pandas as pd
 import scipy
 from scipy import sparse
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
+
+IMPLEMENTATION_VERSION = '2026-10-22-memory-persistent-v2'
 
 def max0(a):
     return float(np.max(a, initial=0.0))
@@ -328,39 +336,68 @@ class LinearModel:
     eta_delta: object = None
 
 
-def network_blocks(case, include_lines):
-    """Positive-injection PTDF flows with zero transformer phase shifts.
+class LineFlowBlocks:
+    """Re-iterable contingency blocks without retaining dense outage matrices."""
+    def __init__(self, case, H, offset, monitored, include_lines):
+        self.case, self.H, self.offset = case, H, offset
+        self.monitored, self.include_lines = monitored, include_lines
 
-    Uses f=K@(B@g-d). This is the negative of the manuscript flow sign;
-    symmetric thermal bounds make the feasible dispatches equivalent.
-    The constant offset below represents demand, not transformer shifts.
-    """
-    cache = case.get('_network_blocks_cache')
-    key = bool(include_lines)
-    if cache is not None and key in cache:
-        return cache[key]
-    ng = len(case['lo'])
-    mon = np.flatnonzero(case['rates'] > 0)
+    def __iter__(self):
+        H, offset, mon, case = self.H, self.offset, self.monitored, self.case
+        yield -1, mon, H[mon], offset[mon]
+        if self.include_lines:
+            for ell in case['eligible']:
+                keep = mon[mon != ell]
+                lodf = case['L'][keep, ell]
+                yield int(ell), keep, H[keep]+np.outer(lodf,H[ell]), offset[keep]+lodf*offset[ell]
+
+
+def network_blocks(case, include_lines):
+    """Positive-injection PTDF flows; zero phase shifts; lazy outage blocks."""
     H = case['K'] @ case['B']
     offset = -case['K'] @ case['d']
-    blocks = [(-1, mon, H[mon], offset[mon])]
+    mon = np.flatnonzero(case['rates'] > 0)
+    return H, offset, mon, LineFlowBlocks(case,H,offset,mon,include_lines)
+
+
+def line_flow_states(case, g, include_lines):
+    """Evaluate line outages from nominal flows without dense outage matrices."""
+    mon = np.flatnonzero(case['rates'] > 0)
+    f = case['K'] @ (case['B'] @ g-case['d'])
+    yield -1, mon, f[mon]
     if include_lines:
         for ell in case['eligible']:
             keep = mon[mon != ell]
-            T = case['K'][keep] + np.outer(case['L'][keep, ell], case['K'][ell])
-            blocks.append((int(ell), keep, T @ case['B'], -(T @ case['d'])))
-    assert all(F.shape[1] == ng for _, _, F, _ in blocks)
-    result = H, offset, mon, blocks
-    if cache is not None:
-        cache[key] = result
-    return result
+            yield int(ell), keep, f[keep]+case['L'][keep,ell]*f[ell]
+
+
+class SparseRows:
+    """Build CSR directly from typed buffers, avoiding Python COO triplet lists."""
+    def __init__(self):
+        self.values = array('d')
+        self.columns = array('q')
+        self.starts = array('q', [0])
+
+    def append(self, indices, values):
+        indices, values = np.asarray(indices,dtype=np.int64), np.asarray(values,dtype=np.float64)
+        nonzero = values != 0
+        self.columns.frombytes(np.ascontiguousarray(indices[nonzero]).tobytes())
+        self.values.frombytes(np.ascontiguousarray(values[nonzero]).tobytes())
+        self.starts.append(len(self.values))
+
+    def matrix(self, nvars):
+        return sparse.csr_matrix((np.frombuffer(self.values,dtype=np.float64),
+                                  np.frombuffer(self.columns,dtype=np.int64),
+                                  np.frombuffer(self.starts,dtype=np.int64)),
+                                 shape=(len(self.starts)-1,nvars),copy=False)
 
 
 def build_model(case, outages, args, exact=False, fixed=None):
     ng, nk = len(case['lo']), len(outages)
     soft = args.thermal_mode == 'soft'
     H, offset, mon, blocks = network_blocks(case, not args.no_line_contingencies)
-    lb, ub, integrality, cost = [], [], [], []
+    lb, ub, cost = array('d'), array('d'), array('d')
+    integrality = array('b')
 
     def variables(low, high, obj=0.0, integer=0):
         low, high = np.atleast_1d(low).astype(float), np.atleast_1d(high).astype(float)
@@ -394,14 +431,12 @@ def build_model(case, outages, args, exact=False, fixed=None):
                     # LaTeX: x_{k,i}\in\{0,1\}; exact MILP benchmark ONLY.
                     x[s, i] = int(variables(0.0, 1.0, integer=1)[0])
 
-    row, col, data, lower, upper = [], [], [], [], []
+    coefficients = SparseRows()
+    lower, upper = array('d'), array('d')
     eta_line, eta_unit, eta_records = [], [], []
 
     def constraint(indices, values, low=-np.inf, high=np.inf):
-        indices, values = np.asarray(indices, dtype=int), np.asarray(values, dtype=float)
-        nz = values != 0
-        row.extend([len(lower)] * int(nz.sum()))
-        col.extend(indices[nz]); data.extend(values[nz])
+        coefficients.append(indices, values)
         lower.append(low); upper.append(high)
 
     def flow_constraints(indices, monitored, F, b, family='line', state=-1):
@@ -414,20 +449,35 @@ def build_model(case, outages, args, exact=False, fixed=None):
             eta_records.extend((int(index), family, int(state), int(j))
                                for index, j in zip(eta, monitored))
         for t, j in enumerate(monitored):
-            idx = list(indices) + ([int(eta[t])] if soft else [])
+            if F is None:
+                # Factor line-outage flows through the shared nominal f variables.
+                idx, values = [int(nominal_flow[j])], [1.0]
+                if state != -1:
+                    idx.append(int(nominal_flow[state]))
+                    values.append(float(case['L'][j,state]))
+            else:
+                idx, values = list(indices), list(F[t])
+            if soft:
+                idx.append(int(eta[t]))
             # LaTeX: f_{s,j}=F_{s,j}u_s+b_{s,j}\le\bar f_j+\eta_{s,j}.
-            constraint(idx, list(F[t]) + ([-1.0] if soft else []), high=case['rates'][j] - b[t])
+            constraint(idx, values + ([-1.0] if soft else []), high=case['rates'][j] - b[t])
             # LaTeX: -f_{s,j}\le\bar f_j+\eta_{s,j}.
             # Together: -\bar f_j-\eta_{s,j}\le f_{s,j}\le\bar f_j+\eta_{s,j}.
-            constraint(idx, list(-F[t]) + ([-1.0] if soft else []), high=case['rates'][j] + b[t])
+            constraint(idx, [-v for v in values] + ([-1.0] if soft else []), high=case['rates'][j] + b[t])
 
     # LaTeX: \mathbf{1}^T g = D (nominal power balance).
     constraint(g, np.ones(ng), case['D'], case['D'])
-    for ell, monitored, F, b in blocks:
-        # LaTeX (code flow sign): f^0=K(Bg-d); zero transformer shifts.
-        # LaTeX (line outage ell): f_j^{L,ell}=f_j^0+L_{j,ell}f_ell^0,
-        # j\ne ell; only non-islanding outages and rateA>0 lines are monitored.
-        flow_constraints(g, monitored, F, b, state=ell)
+    # f0 = H*g + offset. Eliminating these auxiliary variables recovers the
+    # original PTDF/LODF inequalities exactly; all contingencies are retained.
+    nominal_flow = variables(np.full(len(case['rates']),-np.inf),
+                             np.full(len(case['rates']),np.inf))
+    for j in range(len(case['rates'])):
+        constraint(np.r_[g,nominal_flow[j]],np.r_[-H[j],1.0],offset[j],offset[j])
+    flow_constraints(None,mon,None,np.zeros(len(mon)),state=-1)
+    if not args.no_line_contingencies:
+        for ell in case['eligible']:
+            monitored = mon[mon != ell]
+            flow_constraints(None,monitored,None,np.zeros(len(monitored)),state=int(ell))
     for s, k in enumerate(outages):
         # LaTeX: \mathbf{1}^T g_k = D (generator-outage power balance).
         constraint(y[s], np.ones(ng), case['D'], case['D'])
@@ -454,7 +504,9 @@ def build_model(case, outages, args, exact=False, fixed=None):
                 constraint([g[i], z[s], x[s, i]], [1.0, case['a'][i], M], low=M)
                 # LaTeX: g_{k,i}\ge\bar g_i(1-x_{k,i}).
                 constraint([y[s, i], x[s, i]], [1.0, M], low=M)
-    A = sparse.coo_matrix((data, (row, col)), shape=(len(lower), len(lb))).tocsc()
+    print(f'Assembling sparse model: rows={len(lower):,}; variables={len(lb):,}; '
+          f'nonzeros={len(coefficients.values):,} (typed CSR buffers)',flush=True)
+    A = coefficients.matrix(len(lb))
     return LinearModel(A, np.array(lower), np.array(upper), np.array(lb), np.array(ub),
                        np.array(integrality), np.array(cost), g, y, z, x, float(case['gen'].c0.sum()),
                        eta_line=np.array(eta_line, dtype=int), eta_unit=np.array(eta_unit, dtype=int),
@@ -645,8 +697,8 @@ def recover(case, g, k, tol_pu):
 
 def operating_metrics(case, outages, g, outputs, include_lines, penalty):
     H, offset, mon, blocks = network_blocks(case, include_lines)
-    overloads = [np.maximum(np.abs(F @ g + b) - case['rates'][monitored], 0.0)
-                 for _, monitored, F, b in blocks]
+    overloads = [np.maximum(np.abs(flows)-case['rates'][monitored],0.0)
+                 for _,monitored,flows in line_flow_states(case,g,include_lines)]
     line_eta = sum(float(e.sum()) for e in overloads)
     unit_overloads = [np.maximum(np.abs(H[mon] @ y + offset[mon]) - case['rates'][mon], 0.0) for y in outputs]
     unit_eta = sum(float(e.sum()) for e in unit_overloads)
@@ -927,11 +979,11 @@ def apply_eta_limits(model, case, args):
                    row_is_power=np.r_[model.row_is_power, np.ones(len(extra), dtype=bool)])
 
 
-def eta_limit_diagnostics(case, outages, g, outputs, args, prefix=''):
+def eta_limit_diagnostics(case, outages, g, outputs, args, prefix='', record_sink=None):
     """Check limits against actual flows, independently of solver slack values."""
     H, offset, mon, blocks = network_blocks(case, not args.no_line_contingencies)
-    states = [('line', ell, monitored, F@g+b)
-              for ell, monitored, F, b in blocks]
+    states = [('line',ell,monitored,flows)
+              for ell,monitored,flows in line_flow_states(case,g,not args.no_line_contingencies)]
     states.extend(('unit', int(k), mon, H[mon]@y+offset[mon])
                   for k, y in zip(outages, outputs))
     records, sums, violation = [], {'line': 0.0, 'unit': 0.0}, 0.0
@@ -944,14 +996,18 @@ def eta_limit_diagnostics(case, outages, g, outputs, args, prefix=''):
         outage_id = (id_key(case['gen'].iloc[state].gen_ID) if family=='unit' else
                      None if state==-1 else id_key(case['branch'].iloc[state].line_ID))
         for j, flow, eta, limit in zip(monitored, flows, eta_mw, limits):
-            records.append(dict(phase='recovered' if prefix else 'provisional', family=family,
+            record = dict(phase='recovered' if prefix else 'provisional', family=family,
                                 state_kind=kind, outage_ID=outage_id,
                                 line_ID=id_key(case['branch'].iloc[j].line_ID),
                                 flow_MW=float(flow)*case['base'],
                                 rating_MW=float(case['rates'][j])*case['base'],
                                 minimum_eta_MW=float(eta),
                                 individual_eta_cap_MW=float(limit) if np.isfinite(limit) else None,
-                                individual_violation_MW=max(0.0, float(eta-limit))))
+                                individual_violation_MW=max(0.0, float(eta-limit)))
+            if record_sink is None:
+                records.append(record)
+            else:
+                record_sink(record)
     result = {}
     for family in ('line', 'unit'):
         total = getattr(args, 'eta_'+family+'_total_mw')
@@ -1449,7 +1505,7 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
     started = perf_counter()
     # Reuse contingency coefficient matrices in model construction, validation
     # and recovery. The cache is scoped to this case and search.
-    case['_network_blocks_cache'] = {}
+    case.pop('_network_blocks_cache', None)
     t = perf_counter()
     base_lp = apply_eta_limits(add_apr_slacks(
         build_model(case,outages,args,False,fixed),case,outages),case,args)
@@ -1471,6 +1527,7 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
                     weights=[], generation_cost_in_objective=False,
                     cost_caps_enabled=False, threshold_applies=False,
                     shared_model_build_seconds=shared_build,
+                    memory_efficient_construction=True,
                     persistent_gurobi_model=gurobi_session is not None,
                     gurobi_model_build_seconds=gurobi_build,
                     solve_timing_definition='total_solve_seconds sums objective-update, optimize and result-extraction time; one-time Python and native Gurobi builds reported separately; complete experiment includes all stages',
@@ -1483,9 +1540,13 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
     rows, checks_all, details_all, dispatch_all, eta_all = [], [], [], [], []
     best, best_tables = None, None
     saved_count = -1
+    saved_eta_count = 0
+    # Large per-line/state diagnostics are streamed, never accumulated in RAM.
+    with atomic_output(output/'eta_limit_checks.csv') as stream:
+        pass
 
     def checkpoint_search(search):
-        nonlocal saved_count
+        nonlocal saved_count, saved_eta_count
         search.update(total_solve_seconds=sum(row['total_seconds'] for row in rows),
                       completed_result_count=len(rows),
                       shared_model_build_seconds=shared_build,
@@ -1500,20 +1561,38 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
         # while exporting a large table cannot leave this file absent.
         write_search_json(output/'weight_search_summary.json', search)
         if saved_count != len(rows):
+            if rows:
+                print(f'Checkpoint: saving completed test {len(rows)}...',flush=True)
             for name in ('summary', 'weight_results', 'weight_bisection'):
                 write_search_csv(output/(name+'.csv'), rows)
             for name, table in [('apr_checks', checks_all), ('apr_dispatch', details_all),
-                                ('dispatch', dispatch_all), ('eta_limit_checks', eta_all)]:
+                                ('dispatch', dispatch_all)]:
                 write_search_csv(output/(name+'.csv'), table)
             if best is not None:
                 write_search_csv(output/'best_weight.csv', [best])
                 for name, table in best_tables:
                     write_search_csv(output/(name+'.csv'), table)
+                source = output/best['eta_limit_checks_file']
+                with source.open(encoding='utf-8',newline='') as incoming, atomic_output(output/'best_eta_limit_checks.csv') as stream:
+                    shutil.copyfileobj(incoming,stream)
+            for record in rows[saved_eta_count:]:
+                filename = record.get('eta_limit_checks_file')
+                if filename:
+                    target = output/'eta_limit_checks.csv'
+                    with (output/filename).open(encoding='utf-8',newline='') as incoming:
+                        header = incoming.readline()
+                        with target.open('a',encoding='utf-8',newline='') as stream:
+                            if stream.tell()==0:
+                                stream.write(header)
+                            shutil.copyfileobj(incoming,stream)
+                saved_eta_count += 1
             saved_count = len(rows)
         payload = dict(metadata)
         payload.update(search=search, best_result=best, results=rows,
                        weights=[row['weight'] for row in rows])
         write_search_json(output/'metadata.json', payload)
+        if rows:
+            print(f'Checkpoint: completed test {len(rows)} saved.',flush=True)
 
     def evaluate(weight, phase):
         nonlocal best, best_tables
@@ -1562,7 +1641,20 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
                           optimized_objective=objective,penalized_objective=objective,
                           solver_objective_reconstruction_error=reconstruction_error,
                           both_APR_slacks_positive_pairs=both)
-            diagnostics, local_eta=eta_limit_diagnostics(case,outages,vector[model.g],vector[model.y],args)
+            eta_path = output/f'eta_limit_checks_weight_{iteration:04d}.csv'
+            with atomic_output(eta_path) as stream:
+                writer = None
+                def save_eta(record):
+                    nonlocal writer
+                    record.update(model='weight_bisection_LP',weight=weight,
+                                  search_iteration=iteration,search_phase=phase)
+                    if writer is None:
+                        writer = csv.DictWriter(stream,fieldnames=list(record))
+                        writer.writeheader()
+                    writer.writerow(record)
+                diagnostics, local_eta = eta_limit_diagnostics(
+                    case,outages,vector[model.g],vector[model.y],args,record_sink=save_eta)
+            result['eta_limit_checks_file'] = eta_path.name
             result.update(diagnostics)
             objective_verified=bool(reconstruction_error<=1e-7*max(1.0,abs(objective)))
             result['valid_probe']=bool(result['status']=='optimal' and
@@ -1585,7 +1677,7 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
             if accepted and (best is None or weight<best['weight']):
                 best=dict(result)
                 best_tables = [('best_dispatch',local_dispatch),('best_apr_dispatch',local_details),
-                               ('best_apr_checks',local_checks),('best_eta_limit_checks',local_eta)]
+                               ('best_apr_checks',local_checks)]
             label='PASS' if accepted else 'APR_FAIL' if result['valid_probe'] else 'INCONCLUSIVE'
             print(f'  {label}; status={result["status"]}; APR mismatch={metrics["max_APR_L1_error_MW"]:.6g} MW; '
                   f'both-positive pairs={both}; eta={result["thermal_slack_sum_pu"]:.8g} pu; '
@@ -1593,6 +1685,8 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
         else:
             print(f'  INCONCLUSIVE; status={result["status"]}; {result.get("message", "")}',flush=True)
         result['evaluation_seconds']=objective_build+result['total_seconds']+result.get('validation_seconds',0.0)
+        # Persist the small verified result before bulk diagnostic/checkpoint work.
+        write_search_json(output/'last_completed_weight.json',result)
         rows.append(dict(result))
         checks_all.extend(local_checks);details_all.extend(local_details)
         dispatch_all.extend(local_dispatch);eta_all.extend(local_eta)
@@ -1982,6 +2076,7 @@ def run_budget_experiment(case, outages, args, fixed, output, metadata, preproce
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--version', action='version', version='%(prog)s '+IMPLEMENTATION_VERSION)
     p.add_argument('--case', required=True)
     p.add_argument('--case-dir', default='../excel_outputs')
     p.add_argument('--output-dir', default='output_apr_signal')
@@ -2044,6 +2139,7 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    print('Implementation: '+IMPLEMENTATION_VERSION, flush=True)
     standalone_slack = args.normalized_slack_sweep or args.normalized_slack_only or args.weight_bisection
     if args.slack_normalization!='capacity' and not standalone_slack:
         raise ValueError('--slack-normalization none requires --normalized-slack-only, --normalized-slack-sweep, or --weight-bisection')
@@ -2153,7 +2249,8 @@ def main():
     elif args.budget_increase is not None and args.budget_objective in ('apr-slack','operating'):
         weights = [0.0]
     preprocess = perf_counter()-started
-    metadata = dict(arguments=vars(args), case_path=str(path), python=sys.version, platform=platform.platform(),
+    metadata = dict(implementation_version=IMPLEMENTATION_VERSION,
+                    arguments=vars(args), case_path=str(path), python=sys.version, platform=platform.platform(),
                     numpy=np.__version__,scipy=scipy.__version__,pandas=pd.__version__,
                     input_preprocessing_seconds=preprocess, demand_MW=case['D']*case['base'],
                     transformer_phase_shift_assumption='zero; input branch phase-shift data are not used',
