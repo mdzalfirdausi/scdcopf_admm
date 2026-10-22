@@ -150,12 +150,16 @@ import argparse
 from dataclasses import dataclass
 from dataclasses import replace
 import copy
+import csv
 from itertools import product
 import importlib.util
 import json
 from pathlib import Path
 import platform
 import sys
+import traceback
+from contextlib import contextmanager
+from tempfile import NamedTemporaryFile
 from time import perf_counter
 import numpy as np
 import pandas as pd
@@ -1194,8 +1198,58 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
     return 0 if all(row['status']=='optimal' for row in rows) else 2
 
 
+@contextmanager
+def atomic_output(path):
+    """Replace a checkpoint only after its new contents were written in full."""
+    path = Path(path)
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode='w', encoding='utf-8', newline='',
+                                dir=path.parent, prefix='.'+path.name+'.',
+                                suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            yield stream
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def snapshot_data(value):
+    """Detach nested records before any output code iterates their keys."""
+    if isinstance(value, dict):
+        return {key: snapshot_data(item) for key, item in value.copy().items()}
+    if isinstance(value, (list, tuple)):
+        return [snapshot_data(item) for item in tuple(value)]
+    if isinstance(value, np.ndarray):
+        return snapshot_data(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def write_search_json(path, value):
+    payload = snapshot_data(value)
+    with atomic_output(path) as stream:
+        json.dump(payload, stream, indent=2)
+        stream.write('\n')
+
+
+def write_search_csv(path, records):
+    # Each row is private to this write. Avoid passing live result dictionaries
+    # to a DataFrame constructor while assembling the accumulated checkpoints.
+    records = snapshot_data(records)
+    fields = list(dict.fromkeys(key for record in records for key in record))
+    with atomic_output(path) as stream:
+        if fields:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(records)
+
+
 def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
-                      relative_tol=0.0, max_weight=1e6, max_solves=40):
+                      relative_tol=0.0, max_weight=1e6, max_solves=40,
+                      checkpoint=None):
     """Bracket and bisect DIRECT optimal-LP APR acceptance.
 
     evaluate(weight, phase) returns valid_probe and accepted_for_search.
@@ -1203,22 +1257,40 @@ def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
     A fail/pass interval describes observations; it does not certify a
     globally minimal APR-consistent weight without a monotonicity proof.
     """
+    if (not np.isfinite(start) or start <= 0 or
+            not np.isfinite(max_weight) or max_weight < start or
+            not np.isfinite(absolute_tol) or absolute_tol <= 0 or
+            not np.isfinite(relative_tol) or relative_tol < 0 or max_solves < 1):
+        raise ValueError('Invalid weight search limits or tolerances')
     observations = []
     lower, upper = None, None
 
     def probe(weight, phase):
         if len(observations) >= max_solves:
             return None
-        row = dict(evaluate(float(weight), phase))
+        finish('running', current_weight=float(weight), current_phase=phase)
+        try:
+            row = dict(evaluate(float(weight), phase))
+        except BaseException as exc:
+            # Keep the previous completed probes, and do not turn an exception
+            # into an APR failure or silently move a bracket endpoint.
+            try:
+                finish('interrupted' if isinstance(exc, KeyboardInterrupt) else 'error',
+                       failed_weight=float(weight), failed_phase=phase,
+                       error_type=type(exc).__name__, error_message=str(exc),
+                       error_traceback=traceback.format_exc())
+            except Exception as save_error:
+                print(f'ERROR saving failure checkpoint: {save_error}', file=sys.stderr)
+            raise
         row.update(weight=float(weight), search_phase=phase)
         observations.append(row)
         return row
 
-    def finish(reason):
+    def finish(reason, **extra):
         passing = [row['weight'] for row in observations
                    if row.get('valid_probe') and row.get('accepted_for_search')]
         width = None if lower is None or upper is None else upper-lower
-        return dict(termination=reason, solve_count=len(observations),
+        summary = dict(termination=reason, solve_count=len(observations),
                     lower_failed_weight=lower, upper_accepted_weight=upper,
                     interval_width=width,
                     best_passing_weight=min(passing) if passing else None,
@@ -1226,7 +1298,12 @@ def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
                     relative_weight_tolerance=relative_tol,
                     search_completed=reason in ('zero_weight_accepted', 'interval_tolerance'),
                     global_minimum_certified=bool(passing and min(passing)==0.0),
+                    search_in_progress=reason=='running',
                     interpretation='Smallest verified tested weight; positive-weight bracket is a numerical bisection result, not a proof of a global threshold')
+        summary.update(extra)
+        if checkpoint is not None:
+            checkpoint(snapshot_data(summary))
+        return summary
 
     first = probe(start, 'start')
     if not first.get('valid_probe'):
@@ -1277,6 +1354,30 @@ def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
 
 
 def run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess):
+    """Retain a readable summary and traceback even when setup or saving fails."""
+    write_search_json(output/'weight_search_summary.json',
+                      dict(termination='initializing', search_completed=False,
+                           search_in_progress=True, solve_count=0,
+                           best_passing_weight=None, global_minimum_certified=False))
+    try:
+        return _run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess)
+    except BaseException as exc:
+        error_trace = traceback.format_exc()
+        try:
+            summary = json.loads((output/'weight_search_summary.json').read_text(encoding='utf-8'))
+            summary.update(termination='interrupted' if isinstance(exc, KeyboardInterrupt) else 'error',
+                           search_completed=False, search_in_progress=False,
+                           error_type=type(exc).__name__, error_message=str(exc),
+                           error_traceback=error_trace)
+            write_search_json(output/'weight_search_summary.json', summary)
+            with atomic_output(output/'weight_search_error.txt') as stream:
+                stream.write(error_trace)
+        except Exception as save_error:
+            print(f'ERROR saving failure details: {save_error}', file=sys.stderr)
+        raise
+
+
+def _run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess):
     """Solve one shared continuous model at adaptively chosen weights."""
     started = perf_counter()
     # Reuse contingency coefficient matrices in model construction, validation
@@ -1303,10 +1404,38 @@ def run_weight_bisection(case, outages, args, fixed, output, metadata, preproces
     print(f'Adaptive weight search: start={args.weight_start:g}; absolute tolerance={args.weight_tol:g}; '
           f'maximum weight={args.weight_max:g}; solve limit={args.weight_max_solves}')
     rows, checks_all, details_all, dispatch_all, eta_all = [], [], [], [], []
-    best = None
+    best, best_tables = None, None
+    saved_count = -1
+
+    def checkpoint_search(search):
+        nonlocal saved_count
+        search.update(total_solve_seconds=sum(row['total_seconds'] for row in rows),
+                      completed_result_count=len(rows),
+                      shared_model_build_seconds=shared_build,
+                      complete_experiment_seconds=preprocess+perf_counter()-started,
+                      apr_tolerance_MW=args.apr_tol_mw,
+                      best_candidate_operating_cost=None if best is None else best['operating_objective'])
+        # Write the small summary first, including on an exception. A failure
+        # while exporting a large table cannot leave this file absent.
+        write_search_json(output/'weight_search_summary.json', search)
+        if saved_count != len(rows):
+            for name in ('summary', 'weight_results', 'weight_bisection'):
+                write_search_csv(output/(name+'.csv'), rows)
+            for name, table in [('apr_checks', checks_all), ('apr_dispatch', details_all),
+                                ('dispatch', dispatch_all), ('eta_limit_checks', eta_all)]:
+                write_search_csv(output/(name+'.csv'), table)
+            if best is not None:
+                write_search_csv(output/'best_weight.csv', [best])
+                for name, table in best_tables:
+                    write_search_csv(output/(name+'.csv'), table)
+            saved_count = len(rows)
+        payload = dict(metadata)
+        payload.update(search=search, best_result=best, results=rows,
+                       weights=[row['weight'] for row in rows])
+        write_search_json(output/'metadata.json', payload)
 
     def evaluate(weight, phase):
-        nonlocal best
+        nonlocal best, best_tables
         iteration = len(rows)+1
         print(f'Weight test {iteration}: phase={phase}; w={weight:.12g}',flush=True)
         t = perf_counter()
@@ -1371,10 +1500,8 @@ def run_weight_bisection(case, outages, args, fixed, output, metadata, preproces
                 result['status']='validation_failed'
             if accepted and (best is None or weight<best['weight']):
                 best=dict(result)
-                pd.DataFrame([best]).to_csv(output/'best_weight.csv',index=False)
-                for name,table in [('best_dispatch',local_dispatch),('best_apr_dispatch',local_details),
-                                   ('best_apr_checks',local_checks),('best_eta_limit_checks',local_eta)]:
-                    pd.DataFrame(table).to_csv(output/(name+'.csv'),index=False)
+                best_tables = [('best_dispatch',local_dispatch),('best_apr_dispatch',local_details),
+                               ('best_apr_checks',local_checks),('best_eta_limit_checks',local_eta)]
             label='PASS' if accepted else 'APR_FAIL' if result['valid_probe'] else 'INCONCLUSIVE'
             print(f'  {label}; status={result["status"]}; APR mismatch={metrics["max_APR_L1_error_MW"]:.6g} MW; '
                   f'both-positive pairs={both}; eta={result["thermal_slack_sum_pu"]:.8g} pu; '
@@ -1382,29 +1509,23 @@ def run_weight_bisection(case, outages, args, fixed, output, metadata, preproces
         else:
             print(f'  INCONCLUSIVE; status={result["status"]}; {result.get("message", "")}',flush=True)
         result['evaluation_seconds']=objective_build+result['total_seconds']+result.get('validation_seconds',0.0)
-        rows.append(result)
+        rows.append(dict(result))
         checks_all.extend(local_checks);details_all.extend(local_details)
         dispatch_all.extend(local_dispatch);eta_all.extend(local_eta)
-        for name in ('summary','weight_results','weight_bisection'):
-            pd.DataFrame(rows).to_csv(output/(name+'.csv'),index=False)
-        for name,table in [('apr_checks',checks_all),('apr_dispatch',details_all),
-                           ('dispatch',dispatch_all),('eta_limit_checks',eta_all)]:
-            pd.DataFrame(table).to_csv(output/(name+'.csv'),index=False)
-        metadata.update(results=rows,weights=[row['weight'] for row in rows])
-        (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
         return result
 
     search=bisect_apr_weight(evaluate,start=args.weight_start,
                             absolute_tol=args.weight_tol,relative_tol=args.weight_rtol,
-                            max_weight=args.weight_max,max_solves=args.weight_max_solves)
+                            max_weight=args.weight_max,max_solves=args.weight_max_solves,
+                            checkpoint=checkpoint_search)
     search.update(total_solve_seconds=sum(row['total_seconds'] for row in rows),
                   shared_model_build_seconds=shared_build,
                   complete_experiment_seconds=preprocess+perf_counter()-started,
                   apr_tolerance_MW=args.apr_tol_mw,
                   best_candidate_operating_cost=None if best is None else best['operating_objective'])
     metadata.update(search=search,best_result=best,results=rows)
-    (output/'weight_search_summary.json').write_text(json.dumps(search,indent=2),encoding='utf-8')
-    (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+    write_search_json(output/'weight_search_summary.json', search)
+    write_search_json(output/'metadata.json', metadata)
     print('Search termination: '+search['termination'])
     if search['best_passing_weight'] is None:
         print('No directly APR-consistent optimal LP candidate found within the search limits.')
@@ -2036,6 +2157,7 @@ if __name__=='__main__':
         sys.exit(main())
     except Exception as exc:
         print(f'ERROR: {exc}',file=sys.stderr)
+        traceback.print_exc()
         sys.exit(1)
 
 
