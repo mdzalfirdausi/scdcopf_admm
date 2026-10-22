@@ -31,7 +31,7 @@ import scipy
 from scipy import sparse
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 
-IMPLEMENTATION_VERSION = '2026-10-22-apr-comparison-v1'
+IMPLEMENTATION_VERSION = '2026-10-22-apr-comparison-checkpoint-diagnostic-v2'
 
 def max0(a):
     return float(np.max(a, initial=0.0))
@@ -1235,15 +1235,35 @@ def write_search_json(path, value):
 
 
 def write_search_csv(path, records):
-    # Each row is private to this write. Avoid passing live result dictionaries
-    # to a DataFrame constructor while assembling the accumulated checkpoints.
+    """Export private records and identify the export active during a crash.
+
+    Explicit schema loops avoid the generator expression reported in the
+    native-crash traceback. This is a diagnostic workaround, not evidence
+    that CSV field discovery caused the underlying native memory fault.
+    """
+    path = Path(path)
+    print(f'Checkpoint CSV: {path.name}; stage=snapshot', flush=True)
     records = snapshot_data(records)
-    fields = list(dict.fromkeys(key for record in records for key in record))
+    fields = []
+    seen = set()
+    print(f'Checkpoint CSV: {path.name}; rows={len(records)}; stage=columns', flush=True)
+    for index, record in enumerate(records):
+        if type(record) is not dict:
+            raise TypeError(f'{path.name}: row {index} is not a plain dictionary')
+        for key in tuple(record.keys()):
+            if not isinstance(key, str):
+                raise TypeError(f'{path.name}: row {index} has a non-string column name')
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    print(f'Checkpoint CSV: {path.name}; stage=write', flush=True)
     with atomic_output(path) as stream:
         if fields:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
-            writer.writerows(records)
+            for record in records:
+                writer.writerow(record)
+    print(f'Checkpoint CSV: {path.name}; stage=complete', flush=True)
 
 
 def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
