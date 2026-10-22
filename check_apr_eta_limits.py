@@ -158,7 +158,7 @@ from pathlib import Path
 import platform
 import sys
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from tempfile import NamedTemporaryFile
 from time import perf_counter
 import numpy as np
@@ -461,7 +461,99 @@ def build_model(case, outages, args, exact=False, fixed=None):
                        eta_records=eta_records)
 
 
-def solve_model(model, weight, args):
+class GurobiSession:
+    """Keep one native Gurobi model; subsequent solves update only its objective.
+
+    Constraint arrays must be shared by identity with the original LinearModel.
+    Use as a context manager so the model and environment close on every exit.
+    """
+
+    def __init__(self, model, args):
+        import gurobipy as gp
+        started = perf_counter()
+        self.gp = gp
+        self.structure = model
+        self.solve_count = 0
+        self.closed = False
+        self.resources = ExitStack()
+        try:
+            env = self.resources.enter_context(gp.Env(empty=True))
+            env.setParam('OutputFlag', int(args.tee))
+            env.start()
+            gm = self.resources.enter_context(gp.Model(env=env))
+            self.gm = gm
+            gm.Params.Threads = args.threads
+            gm.Params.FeasibilityTol = 1e-9
+            gm.Params.OptimalityTol = 1e-9
+            gm.Params.MIPGap = args.mip_gap
+            gm.Params.TimeLimit = args.time_limit
+            gm.ModelSense = gp.GRB.MINIMIZE
+            self.v = gm.addMVar(len(model.c0),
+                lb=np.where(np.isfinite(model.lb), model.lb, -gp.GRB.INFINITY),
+                ub=np.where(np.isfinite(model.ub), model.ub, gp.GRB.INFINITY),
+                vtype=np.where(model.integer > 0, gp.GRB.BINARY, gp.GRB.CONTINUOUS))
+            eq = np.isfinite(model.lower) & (model.lower == model.upper)
+            up = np.isfinite(model.upper) & ~eq
+            low = np.isfinite(model.lower) & ~eq
+            if eq.any(): gm.addMConstr(model.A[eq], self.v, '=', model.upper[eq])
+            if up.any(): gm.addMConstr(model.A[up], self.v, '<', model.upper[up])
+            if low.any(): gm.addMConstr(model.A[low], self.v, '>', model.lower[low])
+            gm.update()
+            self.build_seconds = perf_counter()-started
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.resources.close()
+
+    def solve(self, model, qscaled, scale):
+        if self.closed:
+            raise RuntimeError('Gurobi session has already been closed')
+        if any(getattr(model, name) is not getattr(self.structure, name)
+               for name in ('A', 'lower', 'upper', 'lb', 'ub', 'integer')):
+            raise ValueError('Persistent Gurobi session allows objective changes only')
+        gp, gm = self.gp, self.gm
+        # No reset, variable creation, or constraint upload between weight tests.
+        # optimize() applies the pending Obj attribute changes automatically.
+        self.v.setAttr(gp.GRB.Attr.Obj, qscaled)
+        self.solve_count += 1
+        gm.optimize()
+        if gm.Status == gp.GRB.INF_OR_UNBD:
+            # Exceptional diagnostic retry, matching the original behavior.
+            gm.Params.DualReductions = 0
+            gm.reset()
+            gm.optimize()
+        status = {gp.GRB.OPTIMAL: 'optimal', gp.GRB.INFEASIBLE: 'infeasible',
+                  gp.GRB.UNBOUNDED: 'unbounded', gp.GRB.INF_OR_UNBD: 'infeasible_or_unbounded',
+                  gp.GRB.TIME_LIMIT: 'limit'}.get(gm.Status, f'gurobi_status_{gm.Status}')
+        info = dict(status=status, message=f'Gurobi status {gm.Status}',
+                    gurobi_session_solve_index=self.solve_count,
+                    gurobi_model_reused=self.solve_count > 1,
+                    solver_runtime_seconds=float(gm.Runtime),
+                    simplex_iterations=float(gm.IterCount))
+        vector = np.array(self.v.X, copy=True) if gm.SolCount else None
+        bound = None
+        if status == 'optimal':
+            bound = float(gm.ObjVal)*scale + model.constant
+        elif model.integer.any():
+            try:
+                if np.isfinite(gm.ObjBound):
+                    bound = float(gm.ObjBound)*scale + model.constant
+            except gp.GurobiError:
+                pass
+        return info, vector, bound
+
+
+def solve_model(model, weight, args, gurobi_session=None):
     t = perf_counter()
     # LaTeX: min q^T v + W\sum_k z_k, where q is the incoming model objective.
     # Signal-only budget model: q^T v=0, W=1, so min \sum_k z_k.
@@ -498,40 +590,12 @@ def solve_model(model, weight, args):
         if getattr(r, 'x', None) is not None and np.isfinite(r.x).all():
             vector = np.asarray(r.x)
     else:
-        import gurobipy as gp
-        with gp.Env(empty=True) as env:
-            env.setParam('OutputFlag', int(args.tee)); env.start()
-            with gp.Model(env=env) as gm:
-                gm.Params.Threads = args.threads
-                gm.Params.FeasibilityTol = 1e-9
-                gm.Params.OptimalityTol = 1e-9
-                gm.Params.MIPGap = args.mip_gap
-                gm.Params.TimeLimit = args.time_limit
-                v = gm.addMVar(len(q), lb=np.where(np.isfinite(model.lb), model.lb, -gp.GRB.INFINITY),
-                              ub=np.where(np.isfinite(model.ub), model.ub, gp.GRB.INFINITY),
-                              vtype=np.where(model.integer > 0, gp.GRB.BINARY, gp.GRB.CONTINUOUS))
-                eq = np.isfinite(model.lower) & (model.lower == model.upper)
-                up = np.isfinite(model.upper) & ~eq; low = np.isfinite(model.lower) & ~eq
-                if eq.any(): gm.addMConstr(model.A[eq], v, '=', model.upper[eq])
-                if up.any(): gm.addMConstr(model.A[up], v, '<', model.upper[up])
-                if low.any(): gm.addMConstr(model.A[low], v, '>', model.lower[low])
-                # LaTeX: \min_v (q/scale)^T v (Gurobi defaults to minimization).
-                gm.setObjective(qscaled @ v); gm.optimize()
-                if gm.Status == gp.GRB.INF_OR_UNBD:
-                    gm.Params.DualReductions = 0; gm.reset(); gm.optimize()
-                status = {gp.GRB.OPTIMAL: 'optimal', gp.GRB.INFEASIBLE: 'infeasible',
-                          gp.GRB.UNBOUNDED: 'unbounded', gp.GRB.INF_OR_UNBD: 'infeasible_or_unbounded',
-                          gp.GRB.TIME_LIMIT: 'limit'}.get(gm.Status, f'gurobi_status_{gm.Status}')
-                result.update(status=status, message=f'Gurobi status {gm.Status}')
-                if gm.SolCount:
-                    vector = np.asarray(v.X)
-                if status == 'optimal':
-                    bound = float(gm.ObjVal) * scale + model.constant
-                elif model.integer.any():
-                    try:
-                        if np.isfinite(gm.ObjBound): bound = float(gm.ObjBound) * scale + model.constant
-                    except gp.GurobiError:
-                        pass
+        if gurobi_session is None:
+            with GurobiSession(model, args) as temporary_session:
+                info, vector, bound = temporary_session.solve(model, qscaled, scale)
+        else:
+            info, vector, bound = gurobi_session.solve(model, qscaled, scale)
+        result.update(info)
     result['total_seconds'] = perf_counter() - t
     result['solver_best_bound_penalized'] = bound
     if vector is not None:
@@ -1360,7 +1424,9 @@ def run_weight_bisection(case, outages, args, fixed, output, metadata, preproces
                            search_in_progress=True, solve_count=0,
                            best_passing_weight=None, global_minimum_certified=False))
     try:
-        return _run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess)
+        with ExitStack() as solver_resources:
+            return _run_weight_bisection(case, outages, args, fixed, output, metadata,
+                                         preprocess, solver_resources)
     except BaseException as exc:
         error_trace = traceback.format_exc()
         try:
@@ -1377,7 +1443,8 @@ def run_weight_bisection(case, outages, args, fixed, output, metadata, preproces
         raise
 
 
-def _run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess):
+def _run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess,
+                           solver_resources):
     """Solve one shared continuous model at adaptively chosen weights."""
     started = perf_counter()
     # Reuse contingency coefficient matrices in model construction, validation
@@ -1389,6 +1456,13 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
     shared_build = perf_counter()-t
     if np.any(base_lp.integer):
         raise ValueError('Weight bisection requires a continuous LP')
+    gurobi_session = None
+    gurobi_build = 0.0
+    if args.backend == 'gurobi':
+        print('Building persistent Gurobi model once for the weight search...', flush=True)
+        gurobi_session = solver_resources.enter_context(GurobiSession(base_lp, args))
+        gurobi_build = gurobi_session.build_seconds
+        print(f'Persistent Gurobi model ready; native build={gurobi_build:.4f}s', flush=True)
     normalized = args.slack_normalization == 'capacity'
     expression = 'sum((splus+sminus)/gmax)' if normalized else 'sum(splus+sminus)'
     metadata.update(experiment='adaptive_APR_weight_bisection',
@@ -1397,6 +1471,9 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
                     weights=[], generation_cost_in_objective=False,
                     cost_caps_enabled=False, threshold_applies=False,
                     shared_model_build_seconds=shared_build,
+                    persistent_gurobi_model=gurobi_session is not None,
+                    gurobi_model_build_seconds=gurobi_build,
+                    solve_timing_definition='total_solve_seconds sums objective-update, optimize and result-extraction time; one-time Python and native Gurobi builds reported separately; complete experiment includes all stages',
                     direct_eta_limits={key:value for key,value in vars(args).items() if key.startswith('eta_')},
                     acceptance='Optimal verified DIRECT LP solution, APR error <= apr_tol_mw, no both-positive slack pairs, and all requested eta limits satisfied',
                     search_interpretation='Numerical bisection on returned-solution APR acceptance; a global monotone threshold has not been established')
@@ -1412,6 +1489,10 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
         search.update(total_solve_seconds=sum(row['total_seconds'] for row in rows),
                       completed_result_count=len(rows),
                       shared_model_build_seconds=shared_build,
+                      persistent_gurobi_model=gurobi_session is not None,
+                      gurobi_model_build_seconds=gurobi_build,
+                      gurobi_model_build_count=0 if gurobi_session is None else 1,
+                      gurobi_weight_solve_count=0 if gurobi_session is None else gurobi_session.solve_count,
                       complete_experiment_seconds=preprocess+perf_counter()-started,
                       apr_tolerance_MW=args.apr_tol_mw,
                       best_candidate_operating_cost=None if best is None else best['operating_objective'])
@@ -1444,7 +1525,10 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
         objective_build = perf_counter()-t
         # The search weight already multiplies s+/s-. The solver's separate
         # signal-weight argument must remain zero.
-        result, vector = solve_model(model,0.0,args)
+        if gurobi_session is None:
+            result, vector = solve_model(model,0.0,args)
+        else:
+            result, vector = solve_model(model,0.0,args,gurobi_session=gurobi_session)
         result.update(model='weight_bisection_LP',weight=weight,slack_weight=weight,
                       search_iteration=iteration,search_phase=phase,
                       slack_normalization=args.slack_normalization,
@@ -1520,6 +1604,10 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
                             checkpoint=checkpoint_search)
     search.update(total_solve_seconds=sum(row['total_seconds'] for row in rows),
                   shared_model_build_seconds=shared_build,
+                  persistent_gurobi_model=gurobi_session is not None,
+                  gurobi_model_build_seconds=gurobi_build,
+                  gurobi_model_build_count=0 if gurobi_session is None else 1,
+                  gurobi_weight_solve_count=0 if gurobi_session is None else gurobi_session.solve_count,
                   complete_experiment_seconds=preprocess+perf_counter()-started,
                   apr_tolerance_MW=args.apr_tol_mw,
                   best_candidate_operating_cost=None if best is None else best['operating_objective'])
