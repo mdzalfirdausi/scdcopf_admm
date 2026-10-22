@@ -1002,29 +1002,45 @@ def run_minimum_eta_fraction(case, outages, args, fixed, output, metadata, prepr
     return 0 if all(row['status']=='optimal' for row in rows) else 2
 
 
-def normalized_slack_objective(model, case, weight, thermal_weight=1.0, normalization='capacity'):
-    """Build the response-slack and thermal-slack objective.
+def normalized_slack_objective(
+    model, case, weight, thermal_weight=1.0, normalization='none'
+):
+    """Minimize original MIP objective + weight * sum(splus+sminus).
 
-    normalization='capacity':
-        min weight*sum((splus+sminus)/gmax) + thermal_weight*sum(eta).
-    normalization='none':
-        min weight*sum(splus+sminus) + thermal_weight*sum(eta).
-    Sweep mode uses thermal_weight=1; slack-only mode uses 0.
-    Power quantities are per unit; capacity-normalized slacks are dimensionless.
-    No generation cost, direct signal penalty, or M_eta factor is included.
+    Retains generation costs, M_eta thermal penalties, and the constant.
+    Response slacks are unnormalized.
     """
-    denominators = (np.array([case['hi'][i] for s,i in model.slack_pairs])
-                    if normalization == 'capacity' else np.ones(len(model.slack_pairs)))
-    if np.any(denominators<=0):
-        raise ValueError('Slack normalization requires strictly positive surviving generator capacities')
-    q = np.zeros_like(model.c0)
-    q[model.splus] = weight/denominators
-    q[model.sminus] = weight/denominators
-    q[model.eta_line] = thermal_weight
-    q[model.eta_unit] = thermal_weight
-    return replace(model, c0=q, constant=0.0,
-                   original_cost=model.c0.copy(), original_constant=model.constant)
+    if normalization != 'none':
+        raise ValueError("Use normalization='none' for this formulation.")
 
+    if thermal_weight != 1.0:
+        raise ValueError(
+            "This formulation retains the original thermal penalties. "
+            "Use thermal_weight=1.0."
+        )
+
+    if not np.isfinite(weight) or weight < 0:
+        raise ValueError("weight must be finite and nonnegative.")
+
+    # Always recover the original objective, avoiding accumulated penalties.
+    if model.original_cost is None:
+        original = model.c0.copy()
+        original_constant = model.constant
+    else:
+        original = model.original_cost.copy()
+        original_constant = model.original_constant
+
+    q = original.copy()
+    q[model.splus] += weight
+    q[model.sminus] += weight
+
+    return replace(
+        model,
+        c0=q,
+        constant=original_constant,
+        original_cost=original,
+        original_constant=original_constant,
+    )
 
 def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, preprocess):
     started = perf_counter()
@@ -1385,9 +1401,9 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
     normalized = args.slack_normalization == 'capacity'
     expression = 'sum((splus+sminus)/gmax)' if normalized else 'sum(splus+sminus)'
     metadata.update(experiment='adaptive_APR_weight_bisection',
-                    optimized_objective='w*'+expression+' + sum(eta_pu)',
+                    optimized_objective='original MIP objective + w*sum(splus+sminus)',
                     slack_normalization=args.slack_normalization,
-                    weights=[], generation_cost_in_objective=False,
+                    weights=[], generation_cost_in_objective=True,
                     cost_caps_enabled=False, threshold_applies=False,
                     shared_model_build_seconds=shared_build,
                     memory_efficient_construction=True,
@@ -1397,7 +1413,10 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
                     direct_eta_limits={key:value for key,value in vars(args).items() if key.startswith('eta_')},
                     acceptance='Optimal verified DIRECT LP solution, APR error <= apr_tol_mw, no both-positive slack pairs, and all requested eta limits satisfied',
                     search_interpretation='Numerical bisection on returned-solution APR acceptance; a global monotone threshold has not been established')
-    print('OBJECTIVE: w*'+expression+' + sum(eta_pu). No generation-cost term or cost caps.')
+    print(
+        'OBJECTIVE: original generation cost + M_eta*sum(eta_pu) '
+        '+ w*sum(splus+sminus).'
+    )
     print(f'Adaptive weight search: start={args.weight_start:g}; absolute tolerance={args.weight_tol:g}; '
           f'maximum weight={args.weight_max:g}; solve limit={args.weight_max_solves}')
     rows, checks_all, details_all, dispatch_all, eta_all = [], [], [], [], []
@@ -1475,7 +1494,7 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
                       search_iteration=iteration,search_phase=phase,
                       slack_normalization=args.slack_normalization,
                       cost_caps_enabled=False,exact_APR_enforced=False,
-                      objective_kind='weighted_response_slacks_plus_eta',
+                      objective_kind='original_objective_plus_weighted_response_slacks',
                       objective_build_seconds=objective_build,
                       model_build_seconds=shared_build if iteration==1 else 0.0,
                       gamma=args.gamma,demand_scale=args.demand_scale,
@@ -1492,7 +1511,10 @@ def _run_weight_bisection(case, outages, args, fixed, output, metadata, preproce
             normalized_sum=float((slack_values/capacities).sum())
             selected_sum=normalized_sum if normalized else unnormalized_sum
             solver_eta=float(vector[model.eta_line].sum()+vector[model.eta_unit].sum())
-            objective=weight*selected_sum+solver_eta
+            original_value = float(
+                model.original_cost @ vector + model.original_constant
+            )
+            objective = weight * selected_sum + original_value
             both=int(np.count_nonzero(np.minimum(vector[model.splus],vector[model.sminus])
                                      *case['base']>args.apr_tol_mw))
             reconstruction_error=abs(objective-result['solver_penalized_objective'])
