@@ -1331,18 +1331,22 @@ def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
         upper = float(start)
     else:
         lower = float(start)
-    # Explicitly check the lower endpoint. If it passes, 0 is the smallest
-    # permitted nonnegative weight, irrespective of behavior at other weights.
-    zero = probe(0.0, 'zero_endpoint')
-    if zero is None:
-        return finish('solve_limit')
-    if not zero.get('valid_probe'):
-        return finish('solver_inconclusive')
-    if zero.get('accepted_for_search'):
-        lower, upper = None, 0.0
-        return finish('zero_weight_accepted')
-    if upper is not None:
-        lower = 0.0
+    # Keep the response-slack coefficient strictly positive.
+    while lower is None:
+        weight = upper / 2.0
+        if weight <= 0.0 or weight == upper:
+            return finish('floating_point_limit')
+
+        row = probe(weight, 'decrease_positive')
+        if row is None:
+            return finish('solve_limit')
+        if not row.get('valid_probe'):
+            return finish('solver_inconclusive')
+
+        if row.get('accepted_for_search'):
+            upper = weight
+        else:
+            lower = weight
     while upper is None:
         if lower >= max_weight:
             return finish('maximum_weight_reached')
