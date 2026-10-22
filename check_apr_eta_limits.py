@@ -2,9 +2,16 @@
 """APR experiments with individual and/or aggregate thermal-slack limits.
 
 New options in this standalone version:
-  Fixed transformer phase shifts are supported through affine PTDF flow
-    offsets in nominal, generator-outage and line-outage states. The Excel
-    branch.angle values are degrees and are retained, not reset to zero.
+  --weight-bisection: adaptive search on w in w*sum(splus+sminus)+sum(eta).
+    Start at --weight-start, check w=0, double a failing starting weight
+    until a passing weight is found, then bisect the fail/pass interval.
+    --weight-tol bounds the final interval width; --weight-max-solves and
+    --weight-max limit the search. Acceptance uses the DIRECT optimal LP
+    solution, never its recovered outputs. This is a numerical search;
+    monotonicity of returned-solution APR acceptance is not assumed proven.
+  Zero transformer phase shifts are assumed, as in the selected Model 1.
+    The branch phase-shift column is not used or required. No fixed
+    phase-shift flow offset is included in either the LP or exact APR MILP.
   --slack-normalization none: remove division by generator capacity in the
     standalone slack-only diagnostic or weighted sweep. Default: capacity.
   --normalized-slack-only: targeted diagnostic minimizing ONLY
@@ -199,8 +206,6 @@ def load_case(path, demand_scale):
     for j, r in branch.iterrows():
         if r.bus_i not in bus_index or r.bus_j not in bus_index or r.bus_i == r.bus_j:
             raise ValueError('Invalid line endpoints')
-        if not np.isfinite(float(r.angle)):
-            raise ValueError('Nonfinite transformer phase shift')
         tap = 1.0 if float(r.ratio) == 0 else float(r.ratio)
         x = float(r.x)
         if not np.isfinite(x) or x == 0 or not np.isfinite(tap) or tap <= 0:
@@ -219,13 +224,6 @@ def load_case(path, demand_scale):
     inverse = np.zeros((n, n))
     inverse[np.ix_(keep, keep)] = np.linalg.solve(bbus[np.ix_(keep, keep)], np.eye(n - 1))
     ptdf = susceptance[:, None] * (incidence @ inverse)
-    # MATPOWER DC convention: f = Bf*theta + Pfinj,
-    # p = Bbus*theta + Pbusinj. Eliminating theta gives
-    # f = K*p + h, h = Pfinj - K*Pbusinj. Fixed shifts are in degrees.
-    phase_shift_rad = np.deg2rad(branch.angle.to_numpy(float))
-    phase_branch_injection = -susceptance * phase_shift_rad
-    phase_bus_injection = incidence.T @ phase_branch_injection
-    phase_flow_offset = phase_branch_injection - ptdf @ phase_bus_injection
     transfer = ptdf @ incidence.T
     den = 1.0 - np.diag(transfer)
     eligible = np.flatnonzero(np.abs(den) >= 1e-8)
@@ -250,11 +248,7 @@ def load_case(path, demand_scale):
     return dict(base=base, bus=bus, gen=gen, branch=branch, A=incidence, b=susceptance,
                 B=B, K=ptdf, L=lodf, eligible=eligible, excluded=excluded, ref=ref,
                 keep=keep, d=pd_pu, D=float(sum(pd_pu)), lo=lo, hi=hi,
-                rates=branch.rateA.to_numpy(float) / base,
-                phase_shift_rad=phase_shift_rad,
-                phase_branch_injection=phase_branch_injection,
-                phase_bus_injection=phase_bus_injection,
-                phase_flow_offset=phase_flow_offset)
+                rates=branch.rateA.to_numpy(float) / base)
 
 
 def id_key(value):
@@ -331,22 +325,31 @@ class LinearModel:
 
 
 def network_blocks(case, include_lines):
-    """Affine positive-injection PTDF flows, including fixed phase shifts."""
+    """Positive-injection PTDF flows with zero transformer phase shifts.
+
+    Uses f=K@(B@g-d). This is the negative of the manuscript flow sign;
+    symmetric thermal bounds make the feasible dispatches equivalent.
+    The constant offset below represents demand, not transformer shifts.
+    """
+    cache = case.get('_network_blocks_cache')
+    key = bool(include_lines)
+    if cache is not None and key in cache:
+        return cache[key]
     ng = len(case['lo'])
     mon = np.flatnonzero(case['rates'] > 0)
     H = case['K'] @ case['B']
-    offset = case['phase_flow_offset'] - case['K'] @ case['d']
+    offset = -case['K'] @ case['d']
     blocks = [(-1, mon, H[mon], offset[mon])]
     if include_lines:
         for ell in case['eligible']:
             keep = mon[mon != ell]
             T = case['K'][keep] + np.outer(case['L'][keep, ell], case['K'][ell])
-            # Apply the LODF update to the FULL pre-outage flow, including h.
-            # This also handles removal of a phase-shifting transformer itself.
-            outage_offset = offset[keep] + case['L'][keep, ell] * offset[ell]
-            blocks.append((int(ell), keep, T @ case['B'], outage_offset))
+            blocks.append((int(ell), keep, T @ case['B'], -(T @ case['d'])))
     assert all(F.shape[1] == ng for _, _, F, _ in blocks)
-    return H, offset, mon, blocks
+    result = H, offset, mon, blocks
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def build_model(case, outages, args, exact=False, fixed=None):
@@ -417,14 +420,14 @@ def build_model(case, outages, args, exact=False, fixed=None):
     # LaTeX: \mathbf{1}^T g = D (nominal power balance).
     constraint(g, np.ones(ng), case['D'], case['D'])
     for ell, monitored, F, b in blocks:
-        # LaTeX (base): f^0=K(Bg-d)+h, fixed phase-shift offset h.
+        # LaTeX (code flow sign): f^0=K(Bg-d); zero transformer shifts.
         # LaTeX (line outage ell): f_j^{L,ell}=f_j^0+L_{j,ell}f_ell^0,
         # j\ne ell; only non-islanding outages and rateA>0 lines are monitored.
         flow_constraints(g, monitored, F, b, state=ell)
     for s, k in enumerate(outages):
         # LaTeX: \mathbf{1}^T g_k = D (generator-outage power balance).
         constraint(y[s], np.ones(ng), case['D'], case['D'])
-        # LaTeX: f^{G,k}=K(Bg_k-d)+h, with soft/hard thermal bounds above.
+        # LaTeX: f^{G,k}=K(Bg_k-d), with soft/hard thermal bounds above.
         flow_constraints(y[s], mon, H[mon], offset[mon], family='unit', state=int(k))
         for i in range(ng):
             if i == k:
@@ -1013,11 +1016,15 @@ def run_minimum_eta_fraction(case, outages, args, fixed, output, metadata, prepr
 
 
 def normalized_slack_objective(model, case, weight, thermal_weight=1.0, normalization='capacity'):
-    """Professor's objective, using PU eta and dimensionless response slacks.
+    """Build the response-slack and thermal-slack objective.
 
-    LaTeX: min w sum_{k,i!=k}(splus_{k,i}+sminus_{k,i})/gmax_i
-                 + sum_{state,j} eta_{state,j}.
-    There is NO direct signal term, generation cost term, or M_eta factor.
+    normalization='capacity':
+        min weight*sum((splus+sminus)/gmax) + thermal_weight*sum(eta).
+    normalization='none':
+        min weight*sum(splus+sminus) + thermal_weight*sum(eta).
+    Sweep mode uses thermal_weight=1; slack-only mode uses 0.
+    Power quantities are per unit; capacity-normalized slacks are dimensionless.
+    No generation cost, direct signal penalty, or M_eta factor is included.
     """
     denominators = (np.array([case['hi'][i] for s,i in model.slack_pairs])
                     if normalization == 'capacity' else np.ones(len(model.slack_pairs)))
@@ -1185,6 +1192,233 @@ def run_normalized_slack_sweep(case, outages, args, fixed, output, metadata, pre
     print(table[[column for column in columns if column in table]].to_string(index=False))
     print('Saved: '+str(output.resolve()))
     return 0 if all(row['status']=='optimal' for row in rows) else 2
+
+
+def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
+                      relative_tol=0.0, max_weight=1e6, max_solves=40):
+    """Bracket and bisect DIRECT optimal-LP APR acceptance.
+
+    evaluate(weight, phase) returns valid_probe and accepted_for_search.
+    A nonoptimal/unverified solve is inconclusive, not a failed APR test.
+    A fail/pass interval describes observations; it does not certify a
+    globally minimal APR-consistent weight without a monotonicity proof.
+    """
+    observations = []
+    lower, upper = None, None
+
+    def probe(weight, phase):
+        if len(observations) >= max_solves:
+            return None
+        row = dict(evaluate(float(weight), phase))
+        row.update(weight=float(weight), search_phase=phase)
+        observations.append(row)
+        return row
+
+    def finish(reason):
+        passing = [row['weight'] for row in observations
+                   if row.get('valid_probe') and row.get('accepted_for_search')]
+        width = None if lower is None or upper is None else upper-lower
+        return dict(termination=reason, solve_count=len(observations),
+                    lower_failed_weight=lower, upper_accepted_weight=upper,
+                    interval_width=width,
+                    best_passing_weight=min(passing) if passing else None,
+                    absolute_weight_tolerance=absolute_tol,
+                    relative_weight_tolerance=relative_tol,
+                    search_completed=reason in ('zero_weight_accepted', 'interval_tolerance'),
+                    global_minimum_certified=bool(passing and min(passing)==0.0),
+                    interpretation='Smallest verified tested weight; positive-weight bracket is a numerical bisection result, not a proof of a global threshold')
+
+    first = probe(start, 'start')
+    if not first.get('valid_probe'):
+        return finish('solver_inconclusive')
+    if first.get('accepted_for_search'):
+        upper = float(start)
+    else:
+        lower = float(start)
+    # Explicitly check the lower endpoint. If it passes, 0 is the smallest
+    # permitted nonnegative weight, irrespective of behavior at other weights.
+    zero = probe(0.0, 'zero_endpoint')
+    if zero is None:
+        return finish('solve_limit')
+    if not zero.get('valid_probe'):
+        return finish('solver_inconclusive')
+    if zero.get('accepted_for_search'):
+        lower, upper = None, 0.0
+        return finish('zero_weight_accepted')
+    if upper is not None:
+        lower = 0.0
+    while upper is None:
+        if lower >= max_weight:
+            return finish('maximum_weight_reached')
+        weight = min(max_weight, 2.0*lower)
+        row = probe(weight, 'expand_upper')
+        if row is None:
+            return finish('solve_limit')
+        if not row.get('valid_probe'):
+            return finish('solver_inconclusive')
+        if row.get('accepted_for_search'):
+            upper = weight
+        else:
+            lower = weight
+    while upper-lower > max(absolute_tol, relative_tol*abs(upper)):
+        midpoint = lower + (upper-lower)/2.0
+        if midpoint == lower or midpoint == upper:
+            return finish('floating_point_limit')
+        row = probe(midpoint, 'bisect')
+        if row is None:
+            return finish('solve_limit')
+        if not row.get('valid_probe'):
+            return finish('solver_inconclusive')
+        if row.get('accepted_for_search'):
+            upper = midpoint
+        else:
+            lower = midpoint
+    return finish('interval_tolerance')
+
+
+def run_weight_bisection(case, outages, args, fixed, output, metadata, preprocess):
+    """Solve one shared continuous model at adaptively chosen weights."""
+    started = perf_counter()
+    # Reuse contingency coefficient matrices in model construction, validation
+    # and recovery. The cache is scoped to this case and search.
+    case['_network_blocks_cache'] = {}
+    t = perf_counter()
+    base_lp = apply_eta_limits(add_apr_slacks(
+        build_model(case,outages,args,False,fixed),case,outages),case,args)
+    shared_build = perf_counter()-t
+    if np.any(base_lp.integer):
+        raise ValueError('Weight bisection requires a continuous LP')
+    normalized = args.slack_normalization == 'capacity'
+    expression = 'sum((splus+sminus)/gmax)' if normalized else 'sum(splus+sminus)'
+    metadata.update(experiment='adaptive_APR_weight_bisection',
+                    optimized_objective='w*'+expression+' + sum(eta_pu)',
+                    slack_normalization=args.slack_normalization,
+                    weights=[], generation_cost_in_objective=False,
+                    cost_caps_enabled=False, threshold_applies=False,
+                    shared_model_build_seconds=shared_build,
+                    direct_eta_limits={key:value for key,value in vars(args).items() if key.startswith('eta_')},
+                    acceptance='Optimal verified DIRECT LP solution, APR error <= apr_tol_mw, no both-positive slack pairs, and all requested eta limits satisfied',
+                    search_interpretation='Numerical bisection on returned-solution APR acceptance; a global monotone threshold has not been established')
+    print('OBJECTIVE: w*'+expression+' + sum(eta_pu). No generation-cost term or cost caps.')
+    print(f'Adaptive weight search: start={args.weight_start:g}; absolute tolerance={args.weight_tol:g}; '
+          f'maximum weight={args.weight_max:g}; solve limit={args.weight_max_solves}')
+    rows, checks_all, details_all, dispatch_all, eta_all = [], [], [], [], []
+    best = None
+
+    def evaluate(weight, phase):
+        nonlocal best
+        iteration = len(rows)+1
+        print(f'Weight test {iteration}: phase={phase}; w={weight:.12g}',flush=True)
+        t = perf_counter()
+        model = normalized_slack_objective(base_lp,case,weight,
+                                           thermal_weight=1.0,normalization=args.slack_normalization)
+        objective_build = perf_counter()-t
+        # The search weight already multiplies s+/s-. The solver's separate
+        # signal-weight argument must remain zero.
+        result, vector = solve_model(model,0.0,args)
+        result.update(model='weight_bisection_LP',weight=weight,slack_weight=weight,
+                      search_iteration=iteration,search_phase=phase,
+                      slack_normalization=args.slack_normalization,
+                      cost_caps_enabled=False,exact_APR_enforced=False,
+                      objective_kind='weighted_response_slacks_plus_eta',
+                      objective_build_seconds=objective_build,
+                      model_build_seconds=shared_build if iteration==1 else 0.0,
+                      gamma=args.gamma,demand_scale=args.demand_scale,
+                      valid_probe=False,accepted_for_search=False)
+        local_checks, local_details, local_dispatch, local_eta = [], [], [], []
+        if vector is not None:
+            t = perf_counter()
+            metrics, local_checks, local_details, local_dispatch = analyze(
+                case,outages,model,vector,args,'weight_bisection_LP',0.0)
+            result.update(metrics)
+            slack_values=vector[model.splus]+vector[model.sminus]
+            capacities=np.array([case['hi'][i] for s,i in model.slack_pairs])
+            unnormalized_sum=float(slack_values.sum())
+            normalized_sum=float((slack_values/capacities).sum())
+            selected_sum=normalized_sum if normalized else unnormalized_sum
+            solver_eta=float(vector[model.eta_line].sum()+vector[model.eta_unit].sum())
+            objective=weight*selected_sum+solver_eta
+            both=int(np.count_nonzero(np.minimum(vector[model.splus],vector[model.sminus])
+                                     *case['base']>args.apr_tol_mw))
+            reconstruction_error=abs(objective-result['solver_penalized_objective'])
+            result.update(objective_response_slack_sum=selected_sum,
+                          normalized_response_slack_sum=normalized_sum,
+                          unnormalized_response_slack_sum_pu=unnormalized_sum,
+                          thermal_slack_sum_pu=metrics['sum_overload_MW']/case['base'],
+                          solver_thermal_slack_sum_pu=solver_eta,
+                          optimized_objective=objective,penalized_objective=objective,
+                          solver_objective_reconstruction_error=reconstruction_error,
+                          both_APR_slacks_positive_pairs=both)
+            diagnostics, local_eta=eta_limit_diagnostics(case,outages,vector[model.g],vector[model.y],args)
+            result.update(diagnostics)
+            objective_verified=bool(reconstruction_error<=1e-7*max(1.0,abs(objective)))
+            result['valid_probe']=bool(result['status']=='optimal' and
+                                       result['solver_point_verified'] and objective_verified)
+            accepted=bool(result['valid_probe'] and
+                          metrics['provisional_original_APR_feasible'] and
+                          metrics['max_APR_L1_error_MW']<=args.apr_tol_mw and
+                          both==0 and diagnostics['eta_limits_satisfied'])
+            result.update(provisional_APR_and_eta_feasible=accepted,
+                          accepted_for_search=accepted,
+                          has_verified_candidate=accepted,
+                          verified_candidate_operating_cost=metrics['operating_objective'] if accepted else None)
+            for table in (local_checks,local_details,local_dispatch,local_eta):
+                for record in table:
+                    record.update(model='weight_bisection_LP',weight=weight,
+                                  search_iteration=iteration,search_phase=phase)
+            result['validation_seconds']=perf_counter()-t
+            if not result['solver_point_verified'] or not objective_verified:
+                result['status']='validation_failed'
+            if accepted and (best is None or weight<best['weight']):
+                best=dict(result)
+                pd.DataFrame([best]).to_csv(output/'best_weight.csv',index=False)
+                for name,table in [('best_dispatch',local_dispatch),('best_apr_dispatch',local_details),
+                                   ('best_apr_checks',local_checks),('best_eta_limit_checks',local_eta)]:
+                    pd.DataFrame(table).to_csv(output/(name+'.csv'),index=False)
+            label='PASS' if accepted else 'APR_FAIL' if result['valid_probe'] else 'INCONCLUSIVE'
+            print(f'  {label}; status={result["status"]}; APR mismatch={metrics["max_APR_L1_error_MW"]:.6g} MW; '
+                  f'both-positive pairs={both}; eta={result["thermal_slack_sum_pu"]:.8g} pu; '
+                  f'cost={metrics["operating_objective"]:.8f}; solve={result["total_seconds"]:.4f}s',flush=True)
+        else:
+            print(f'  INCONCLUSIVE; status={result["status"]}; {result.get("message", "")}',flush=True)
+        result['evaluation_seconds']=objective_build+result['total_seconds']+result.get('validation_seconds',0.0)
+        rows.append(result)
+        checks_all.extend(local_checks);details_all.extend(local_details)
+        dispatch_all.extend(local_dispatch);eta_all.extend(local_eta)
+        for name in ('summary','weight_results','weight_bisection'):
+            pd.DataFrame(rows).to_csv(output/(name+'.csv'),index=False)
+        for name,table in [('apr_checks',checks_all),('apr_dispatch',details_all),
+                           ('dispatch',dispatch_all),('eta_limit_checks',eta_all)]:
+            pd.DataFrame(table).to_csv(output/(name+'.csv'),index=False)
+        metadata.update(results=rows,weights=[row['weight'] for row in rows])
+        (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+        return result
+
+    search=bisect_apr_weight(evaluate,start=args.weight_start,
+                            absolute_tol=args.weight_tol,relative_tol=args.weight_rtol,
+                            max_weight=args.weight_max,max_solves=args.weight_max_solves)
+    search.update(total_solve_seconds=sum(row['total_seconds'] for row in rows),
+                  shared_model_build_seconds=shared_build,
+                  complete_experiment_seconds=preprocess+perf_counter()-started,
+                  apr_tolerance_MW=args.apr_tol_mw,
+                  best_candidate_operating_cost=None if best is None else best['operating_objective'])
+    metadata.update(search=search,best_result=best,results=rows)
+    (output/'weight_search_summary.json').write_text(json.dumps(search,indent=2),encoding='utf-8')
+    (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+    print('Search termination: '+search['termination'])
+    if search['best_passing_weight'] is None:
+        print('No directly APR-consistent optimal LP candidate found within the search limits.')
+    else:
+        print(f'Smallest verified tested weight: {search["best_passing_weight"]:.12g}')
+        if search['lower_failed_weight'] is not None:
+            print(f'Observed fail/pass interval: [{search["lower_failed_weight"]:.12g}, '
+                  f'{search["upper_accepted_weight"]:.12g}]; width={search["interval_width"]:.6g}')
+        print(f'Selected operating cost: {best["operating_objective"]:.8f}; '
+              f'APR mismatch={best["max_APR_L1_error_MW"]:.6g} MW')
+    print(f'Total LP solve time: {search["total_solve_seconds"]:.6f} s; '
+          f'complete experiment: {search["complete_experiment_seconds"]:.6f} s')
+    print('Saved: '+str(output.resolve()))
+    return 0 if search['search_completed'] and best is not None else 2
 
 
 def run_budget_experiment(case, outages, args, fixed, output, metadata, preprocess, weights):
@@ -1574,6 +1808,12 @@ def parser():
     p.add_argument('--min-eta-fraction', action='store_true', help='Standalone diagnostic: minimize delta with eta <= delta*rating on every monitored line/state, no cost caps. Optional --compare-exact solves the exact APR minimum-delta MILP too.')
     p.add_argument('--normalized-slack-sweep', action='store_true', help='Standalone high-to-low sweep: min w*sum((splus+sminus)/gmax)+sum(eta_pu). Uses --weights, optional direct eta caps and --compare-exact (original cost, same caps). No cost budgets.')
     p.add_argument('--normalized-slack-only', action='store_true', help='Targeted diagnostic: solve LP AND exact-APR MILP minimizing ONLY sum((splus+sminus)/gmax). No thermal or generation cost objective. Optional direct eta caps apply equally to both.')
+    p.add_argument('--weight-bisection', action='store_true', help='Adaptive LP search: start at --weight-start, bracket a passing weight, and bisect the APR-fail/APR-pass interval. No weight grid or cost budgets. Use --slack-normalization none for the current method.')
+    p.add_argument('--weight-start', type=float, default=1.0, help='Positive initial weight for adaptive search (default 1).')
+    p.add_argument('--weight-tol', type=float, default=1e-3, help='Absolute tolerance on final fail/pass WEIGHT interval width (default 0.001). Distinct from --apr-tol-mw.')
+    p.add_argument('--weight-rtol', type=float, default=0.0, help='Optional relative weight interval tolerance; stop at max(weight-tol,weight-rtol*upper). Default 0.')
+    p.add_argument('--weight-max', type=float, default=1e6, help='Largest weight allowed during upper-bracket expansion (default 1e6).')
+    p.add_argument('--weight-max-solves', type=int, default=40, help='Maximum LP solves including start, zero endpoint and expansion (default 40).')
     p.add_argument('--slack-normalization', choices=['capacity','none'], default='capacity', help='Standalone slack modes: capacity divides each slack pair by its generator Pmax (default); none minimizes the unnormalized sum instead. Applies equally to LP and exact-APR comparator.')
     for family, description in [('line','nominal and line-outage states'), ('unit','generator-outage states')]:
         individual = p.add_mutually_exclusive_group()
@@ -1595,13 +1835,24 @@ def parser():
 
 def main():
     args = parser().parse_args()
-    if args.slack_normalization!='capacity' and not (args.normalized_slack_sweep or args.normalized_slack_only):
-        raise ValueError('--slack-normalization none requires --normalized-slack-only or --normalized-slack-sweep')
+    standalone_slack = args.normalized_slack_sweep or args.normalized_slack_only or args.weight_bisection
+    if args.slack_normalization!='capacity' and not standalone_slack:
+        raise ValueError('--slack-normalization none requires --normalized-slack-only, --normalized-slack-sweep, or --weight-bisection')
+    if args.weight_bisection:
+        for key in ('weight_start','weight_tol','weight_max'):
+            if not np.isfinite(getattr(args,key)) or getattr(args,key)<=0:
+                raise ValueError(f'{key} must be positive and finite')
+        if not np.isfinite(args.weight_rtol) or args.weight_rtol<0:
+            raise ValueError('weight-rtol must be finite and nonnegative')
+        if args.weight_max<args.weight_start or args.weight_max_solves<2:
+            raise ValueError('weight-max must be at least weight-start, and weight-max-solves must be at least 2')
+        if args.compare_exact:
+            raise ValueError('--weight-bisection uses LP solves only; run an exact-APR comparison separately')
     eta_values = [value for key,value in vars(args).items() if key.startswith('eta_')]
     eta_requested = any(value is not None for value in eta_values)
-    if args.normalized_slack_sweep or args.normalized_slack_only:
-        if args.normalized_slack_sweep and args.normalized_slack_only:
-            raise ValueError('Use either --normalized-slack-sweep or --normalized-slack-only, not both')
+    if standalone_slack:
+        if sum((args.normalized_slack_sweep,args.normalized_slack_only,args.weight_bisection))>1:
+            raise ValueError('Choose one of --normalized-slack-sweep, --normalized-slack-only, or --weight-bisection')
         if args.thermal_mode!='soft' or args.min_eta_fraction or args.budget_increase is not None or args.no_generation_budget or args.thermal_cost_budgets!='on':
             raise ValueError('--normalized-slack-sweep requires soft mode and replaces budget modes. Remove --budget-increase, --no-generation-budget and --thermal-cost-budgets off.')
         if args.compare_weighted_exact or args.lexicographic_cost or args.include_threshold:
@@ -1617,7 +1868,7 @@ def main():
             raise ValueError('Cost-budget epsilons, reference costs and allowances do not apply to --min-eta-fraction')
     if any(value is not None and (not np.isfinite(value) or value < 0) for value in eta_values):
         raise ValueError('Direct eta limits must be finite and nonnegative')
-    if eta_requested and ((args.budget_increase is None and not (args.normalized_slack_sweep or args.normalized_slack_only)) or args.thermal_mode != 'soft'):
+    if eta_requested and ((args.budget_increase is None and not standalone_slack) or args.thermal_mode != 'soft'):
         raise ValueError('Direct eta limits require --thermal-mode soft and a budget experiment (--budget-increase)')
     if args.thermal_cost_budgets == 'off':
         if args.budget_mode != 'split' or not eta_requested:
@@ -1696,9 +1947,8 @@ def main():
     metadata = dict(arguments=vars(args), case_path=str(path), python=sys.version, platform=platform.platform(),
                     numpy=np.__version__,scipy=scipy.__version__,pandas=pd.__version__,
                     input_preprocessing_seconds=preprocess, demand_MW=case['D']*case['base'],
-                    fixed_phase_shift_branches=int(np.count_nonzero(np.abs(case['phase_shift_rad'])>np.deg2rad(1e-10))),
-                    max_abs_phase_flow_offset_MW=float(np.max(np.abs(case['phase_flow_offset'])))*case['base'],
-                    flow_convention='f=K@(B@g-d)+h; fixed phase shifts retained in h; LODF applied to full flows',
+                    transformer_phase_shift_assumption='zero; input branch phase-shift data are not used',
+                    flow_convention='f=K@(B@g-d); no transformer phase-shift offsets; symmetric thermal limits',
                     generator_contingencies=[id_key(case['gen'].iloc[k].gen_ID) for k in outages],
                     line_contingencies=0 if args.no_line_contingencies else len(case['eligible']),
                     excluded_islanding=len(excluded) if not args.no_line_contingencies else 0,
@@ -1712,10 +1962,8 @@ def main():
     (output/'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
     print(f'Case={path.name}; demand={case["D"]*case["base"]:g} MW; gamma={args.gamma:g}; solver={args.backend}')
     print(f'Generator outages={len(outages)}; line outages={metadata["line_contingencies"]}; excluded islanding={metadata["excluded_islanding"]}; mode={args.thermal_mode}')
-    if metadata['fixed_phase_shift_branches']:
-        print(f'Fixed phase shifts retained: {metadata["fixed_phase_shift_branches"]} active branch(es); '
-              f'max |h|={metadata["max_abs_phase_flow_offset_MW"]:.6g} MW')
-    if not args.min_eta_fraction and not (args.normalized_slack_sweep or args.normalized_slack_only):
+    print('Transformer phase shifts: assumed zero; branch phase-shift data ignored (Model 1).')
+    if not args.min_eta_fraction and not standalone_slack:
         print(f'Candidate soft-limit threshold B={B:.8g}; tested W={weights}')
         print('NOTE: The proposed sufficient-weight argument concerns only SOFT limits with unbounded slacks and NO cost budget.')
     if np.any(case['gen'].c2.to_numpy(float)!=0): print('NOTE: c2 ignored; using linear c1 generation costs.')
@@ -1725,6 +1973,8 @@ def main():
         return 2
     if args.min_eta_fraction:
         return run_minimum_eta_fraction(case,outages,args,fixed,output,metadata,preprocess)
+    if args.weight_bisection:
+        return run_weight_bisection(case,outages,args,fixed,output,metadata,preprocess)
     if args.normalized_slack_sweep or args.normalized_slack_only:
         return run_normalized_slack_sweep(case,outages,args,fixed,output,metadata,preprocess)
     if args.budget_increase is not None:
