@@ -51,7 +51,7 @@ python --version
 
 srun --ntasks=1 --cpus-per-task="$CPU_BUDGET" --cpu-bind=cores \
     python -u check_apr_eta_limits.py \
-    --case pglib_opf_case300_ieee.xlsx \
+    --case pglib_opf_case1354_pegase.xlsx \
     --case-dir ../excel_outputs \
     --solver gurobi \
     --threads "$CPU_BUDGET" \
