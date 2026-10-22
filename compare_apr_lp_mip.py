@@ -844,6 +844,14 @@ def apply_eta_limits(model, case, args):
 
 def eta_limit_diagnostics(case, outages, g, outputs, args, prefix='', record_sink=None):
     """Check limits against actual flows, independently of solver slack values."""
+    line_ids = tuple(
+        id_key(value)
+        for value in case['branch']['line_ID'].to_numpy(copy=True)
+    )
+    gen_ids = tuple(
+        id_key(value)
+        for value in case['gen']['gen_ID'].to_numpy(copy=True)
+    )
     H, offset, mon, blocks = network_blocks(case, not args.no_line_contingencies)
     states = [('line',ell,monitored,flows)
               for ell,monitored,flows in line_flow_states(case,g,not args.no_line_contingencies)]
@@ -856,12 +864,15 @@ def eta_limit_diagnostics(case, outages, g, outputs, args, prefix='', record_sin
         sums[family] += float(eta_mw.sum())
         violation = max(violation, max0(eta_mw-limits))
         kind = 'generator_outage' if family=='unit' else 'nominal' if state==-1 else 'line_outage'
-        outage_id = (id_key(case['gen'].iloc[state].gen_ID) if family=='unit' else
-                     None if state==-1 else id_key(case['branch'].iloc[state].line_ID))
+        outage_id = (
+            gen_ids[int(state)] if family == 'unit'
+            else None if state == -1
+            else line_ids[int(state)]
+        )
         for j, flow, eta, limit in zip(monitored, flows, eta_mw, limits):
             record = dict(phase='recovered' if prefix else 'provisional', family=family,
                                 state_kind=kind, outage_ID=outage_id,
-                                line_ID=id_key(case['branch'].iloc[j].line_ID),
+                                line_ID=line_ids[int(j)],
                                 flow_MW=float(flow)*case['base'],
                                 rating_MW=float(case['rates'][j])*case['base'],
                                 minimum_eta_MW=float(eta),
