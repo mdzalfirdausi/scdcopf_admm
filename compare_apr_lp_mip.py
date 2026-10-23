@@ -3,6 +3,7 @@
 Self-contained; no check_apr_eta_limits.py import is needed.
 All methods use the same zero-phase-shift, soft-limit network and linear costs.
 Optional --with-lp-start also solves a fresh MIP using the verified LP candidate.
+Use --lp-only to save the LP bisection results and exit before any MIP build.
 """
 import argparse
 from array import array
@@ -31,7 +32,7 @@ import scipy
 from scipy import sparse
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 
-IMPLEMENTATION_VERSION = '2026-10-22-apr-comparison-checkpoint-diagnostic-v2'
+IMPLEMENTATION_VERSION = '2026-10-23-apr-comparison-lp-only-v4'
 
 def max0(a):
     return float(np.max(a, initial=0.0))
@@ -1326,8 +1327,8 @@ def bisect_apr_weight(evaluate, start=1.0, absolute_tol=1e-3,
                     best_passing_weight=min(passing) if passing else None,
                     absolute_weight_tolerance=absolute_tol,
                     relative_weight_tolerance=relative_tol,
-                    search_completed=reason in ('zero_weight_accepted', 'interval_tolerance'),
-                    global_minimum_certified=bool(passing and min(passing)==0.0),
+                    search_completed=(reason == 'interval_tolerance'),
+                    global_minimum_certified=False,
                     search_in_progress=reason=='running',
                     interpretation='Smallest verified tested weight; positive-weight bracket is a numerical bisection result, not a proof of a global threshold')
         summary.update(extra)
@@ -2283,6 +2284,7 @@ def comparison_parser():
     p.add_argument('--apr-tol-mw', type=float, default=1e-4)
     p.add_argument('--feas-tol-mw', type=float, default=1e-4)
     p.add_argument('--with-lp-start', action='store_true', help='Also run a fresh Gurobi MIP using the verified LP candidate as a full MIP start.')
+    p.add_argument('--lp-only', action='store_true', help='Run only positive-weight LP bisection and validation; skip both MIP runs even if --with-lp-start is supplied.')
     p.add_argument('--tee', action='store_true', help='Print solver logs, including whether Gurobi accepts the MIP start.')
     return p
 
@@ -2467,7 +2469,7 @@ def comparison_main():
     args.time_limit=options.lp_time_limit
     args.weight_bisection=True;args.slack_normalization='none';args.thermal_mode='soft'
     args.backend=args.solver if args.solver!='auto' else ('gurobi' if importlib.util.find_spec('gurobipy') else 'highs')
-    if args.with_lp_start and args.backend!='gurobi':
+    if args.with_lp_start and not args.lp_only and args.backend!='gurobi':
         raise ValueError('--with-lp-start requires --solver gurobi')
     begun=perf_counter();path=resolve_case(args.case,args.case_dir)
     case=load_case(path,args.demand_scale);case['a']=args.gamma*(case['hi']-case['lo']);args.base=case['base']
@@ -2501,11 +2503,15 @@ def comparison_main():
     if args.backend=='gurobi':
         import gurobipy as gp
         metadata['gurobi_version']=list(gp.gurobi.version())
+    metadata.update(run_mode='lp_only' if args.lp_only else 'comparison',
+                    mip_runs_enabled=not args.lp_only)
     common=perf_counter()-begun;metadata['common_preprocessing_seconds']=common
     write_search_json(root/'settings.json',metadata)
     case['branch'].iloc[case['excluded']].to_csv(root/'excluded_line_outages.csv',index=False)
     print(f'Comparison version: {IMPLEMENTATION_VERSION}\nCase: {path.name}; generator outages={len(outages)}; line outages={metadata["line_outages"]}',flush=True)
     print('Common evaluation: generation cost + penalty * REQUIRED overload_pu. Linear generation costs; zero phase shifts.',flush=True)
+    if args.lp_only:
+        print('RUN MODE: LP bisection only; neither MIP model will be built or solved.',flush=True)
     if np.any(case['gen'].c2.to_numpy(float)!=0):
         print('NOTE: c2 is ignored consistently in BOTH models, matching the original linear-cost MIP.',flush=True)
     rows=[];candidate=None
@@ -2533,6 +2539,17 @@ def comparison_main():
     lp['method_stage_seconds']=perf_counter()-t
     lp['pipeline_seconds']=common+lp['method_stage_seconds']
     rows.append(lp);comparison_report(rows,metadata,root)
+    if args.lp_only:
+        write_search_csv(root/'lp_result.csv', [lp])
+        write_search_json(root/'lp_result.json', lp)
+        columns=['method','status','search_completed','weight','weight_interval_width',
+                 'original_soft_model_feasible','original_objective',
+                 'max_APR_L1_error_MW','lp_solve_count','pipeline_seconds']
+        table=pd.DataFrame([lp])
+        print('\nLP BISECTION RESULT\n'+table[[c for c in columns if c in table]].to_string(index=False))
+        print('LP-only run finished; both MIP runs skipped.',flush=True)
+        print('Saved: '+str(root.resolve()))
+        return 0 if lp.get('original_soft_model_feasible') else 2
     cold=run_comparison_mip(case,outages,args,root,'mip_cold')
     cold['pipeline_seconds']=common+cold['method_stage_seconds']
     rows.append(cold);comparison_report(rows,metadata,root)
