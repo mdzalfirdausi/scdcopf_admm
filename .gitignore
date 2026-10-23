@@ -22,3 +22,15 @@ venv/
 *.log
 *.lp
 *.mps
+
+# Generated experiments and logs
+/table_B_parallel_*/
+/output_*/
+/uncertainty/
+__pycache__/
+*.py[cod]
+*.out
+*.err
+*.log
+*.npz
+*.zip
