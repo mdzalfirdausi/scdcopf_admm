@@ -4,6 +4,7 @@ Self-contained; no check_apr_eta_limits.py import is needed.
 All methods use the same zero-phase-shift, soft-limit network and linear costs.
 Optional --with-lp-start also solves a fresh MIP using the verified LP candidate.
 Use --lp-only to save the LP bisection results and exit before any MIP build.
+Use --mip-only to solve only the original MIP from scratch, without an LP search.
 """
 import argparse
 from array import array
@@ -32,7 +33,7 @@ import scipy
 from scipy import sparse
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 
-IMPLEMENTATION_VERSION = '2026-10-23-apr-comparison-lp-only-v4'
+IMPLEMENTATION_VERSION = '2026-10-23-apr-comparison-modes-v5'
 
 def max0(a):
     return float(np.max(a, initial=0.0))
@@ -2284,7 +2285,9 @@ def comparison_parser():
     p.add_argument('--apr-tol-mw', type=float, default=1e-4)
     p.add_argument('--feas-tol-mw', type=float, default=1e-4)
     p.add_argument('--with-lp-start', action='store_true', help='Also run a fresh Gurobi MIP using the verified LP candidate as a full MIP start.')
-    p.add_argument('--lp-only', action='store_true', help='Run only positive-weight LP bisection and validation; skip both MIP runs even if --with-lp-start is supplied.')
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--lp-only', action='store_true', help='Run only positive-weight LP bisection and validation; skip both MIP runs even if --with-lp-start is supplied.')
+    mode.add_argument('--mip-only', action='store_true', help='Solve only the original MIP from scratch; skip LP bisection and LP-derived MIP starts.')
     p.add_argument('--tee', action='store_true', help='Print solver logs, including whether Gurobi accepts the MIP start.')
     return p
 
@@ -2454,6 +2457,8 @@ def comparison_report(rows, metadata, root):
 
 def comparison_main():
     options=comparison_parser().parse_args()
+    if options.mip_only and options.with_lp_start:
+        raise ValueError('--mip-only runs the MIP from scratch; omit --with-lp-start.')
     for key in ('demand_scale','penalty','weight_start','weight_tol','weight_max',
                 'lp_time_limit','mip_time_limit','apr_tol_mw','feas_tol_mw'):
         if not np.isfinite(getattr(options,key)) or getattr(options,key)<=0:
@@ -2503,7 +2508,7 @@ def comparison_main():
     if args.backend=='gurobi':
         import gurobipy as gp
         metadata['gurobi_version']=list(gp.gurobi.version())
-    metadata.update(run_mode='lp_only' if args.lp_only else 'comparison',
+    metadata.update(run_mode='lp_only' if args.lp_only else 'mip_only' if args.mip_only else 'comparison',
                     mip_runs_enabled=not args.lp_only)
     common=perf_counter()-begun;metadata['common_preprocessing_seconds']=common
     write_search_json(root/'settings.json',metadata)
@@ -2515,6 +2520,19 @@ def comparison_main():
     if np.any(case['gen'].c2.to_numpy(float)!=0):
         print('NOTE: c2 is ignored consistently in BOTH models, matching the original linear-cost MIP.',flush=True)
     rows=[];candidate=None
+    if args.mip_only:
+        print('RUN MODE: Original MIP only, from scratch; no LP weight search.',flush=True)
+        cold=run_comparison_mip(case,outages,args,root,'mip_cold')
+        cold['pipeline_seconds']=common+cold['method_stage_seconds']
+        rows.append(cold);comparison_report(rows,metadata,root)
+        write_search_csv(root/'mip_result.csv', [cold])
+        write_search_json(root/'mip_result.json', cold)
+        columns=['method','status','original_soft_model_feasible','original_objective',
+                 'mip_lower_bound','mip_relative_gap','solve_seconds','pipeline_seconds']
+        table=pd.DataFrame(rows)
+        print('\nORIGINAL MIP RESULT\n'+table[[c for c in columns if c in table]].to_string(index=False))
+        print('Saved: '+str(root.resolve()))
+        return 0 if cold.get('original_soft_model_feasible') else 2
     lpdir=root/'lp_search';lpdir.mkdir()
     t=perf_counter()
     lp=dict(method='lp_bisection',status='error',original_soft_model_feasible=False,original_objective=None)
