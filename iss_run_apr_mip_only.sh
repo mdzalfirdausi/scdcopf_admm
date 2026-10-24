@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #SBATCH --job-name=apr_mip_only
 #SBATCH --partition=main
