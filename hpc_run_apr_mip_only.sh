@@ -73,6 +73,7 @@ echo "Python: $(command -v python)"
 echo "Start time: $(date)"
 python --version
 srun --ntasks=1 --cpus-per-task="$CPU_BUDGET" --cpu-bind=cores \
+    /usr/bin/time -v \
     python -u compare_apr_lp_mip.py --mip-only \
     --case "$CASE_NAME" \
     --solver gurobi \
