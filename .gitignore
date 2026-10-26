@@ -37,3 +37,6 @@ __pycache__/
 *.log
 *.npz
 *.zip
+
+# Generated Table B experiment outputs
+/table_B_*/
