@@ -30,7 +30,7 @@ CASE_TAG="${CASE_NAME##*/}"
 CASE_TAG="${CASE_TAG%.xlsx}"
 OUT_DIR="$PWD/output_apr_warm_only_${CASE_TAG}_${SLURM_JOB_ID}"
 srun --ntasks=1 --cpus-per-task="$SLURM_CPUS_PER_TASK" --cpu-bind=cores \
-  /usr/bin/time -v python -u run_apr_warm_only.py \
+    python -u run_apr_warm_only.py \
   --warm-only --lp-source "$LP_SOURCE" \
   --expected-start-objective "$EXPECTED_OBJECTIVE" \
   --case "$CASE_NAME" --case-dir ../excel_outputs \
