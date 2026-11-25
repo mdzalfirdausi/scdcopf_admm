@@ -40,3 +40,5 @@ __pycache__/
 
 # Generated Table B experiment outputs
 /table_B_*/
+# Generated workstation reruns
+/rerun_r13_300*/
